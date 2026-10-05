@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.DS_Store
+*.log
+
+# Zoho self-client credential dumps (contain client_secret / authorization code)
+backend/self_client*.json
+

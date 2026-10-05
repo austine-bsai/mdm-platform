@@ -1,0 +1,27 @@
+{
+  "tasks": {
+    "dev": "deno run --watch --allow-net --allow-env --allow-read --env-file=.env backend/main.ts",
+    "start": "deno run --allow-net --allow-env --allow-read --env-file=.env backend/main.ts",
+    "worker": "deno run --allow-net --allow-env --env-file=.env backend/worker.ts",
+    "check": "deno check backend/main.ts backend/worker.ts",
+    "test": "deno test --allow-env backend/tests/",
+    "keygen": "deno eval \"const b=crypto.getRandomValues(new Uint8Array(32));console.log(btoa(String.fromCharCode(...b)))\"",
+    "zoho-import": "deno run --allow-net --allow-env --allow-read --allow-sys --env-file=.env scripts/import-zoho-refresh-token.ts"
+  },
+  "imports": {
+    "hono": "npm:hono@^4.6.0",
+    "hono/": "npm:/hono@^4.6.0/",
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@^2.45.0"
+  },
+  "compilerOptions": {
+    "strict": true
+  },
+  "fmt": {
+    "lineWidth": 100
+  },
+  "lint": {
+    "exclude": [
+      "frontend/"
+    ]
+  }
+}
