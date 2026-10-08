@@ -13,6 +13,12 @@ export type DeviceRow = {
   owned_by: number | null;
   is_lost_mode: boolean;
   is_removed: boolean;
+  is_supervised?: boolean | null;
+  is_profileowner?: boolean | null;
+  is_knox?: boolean | null;
+  serial_number?: string | null;
+  imei?: string | null;
+  assigned_user_id?: string | null;
 };
 
 export type GroupRow = {

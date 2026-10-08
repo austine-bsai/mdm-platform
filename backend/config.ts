@@ -22,6 +22,8 @@ export type Config = Readonly<{
   confirmTtlMinutes: number;
   workerIntervalSeconds: number;
   syncIntervalMinutes: number;
+  deviceStaleHours: number; // > this since last Zoho check-in → UI shows "stale" badge
+  deviceZombieDays: number; // > this since last check-in → auto-mark is_removed in sync
   cookieSecure: boolean;
 }>;
 
@@ -75,6 +77,8 @@ export function getConfig(): Config {
     confirmTtlMinutes: num("CONFIRM_TTL_MINUTES", 10),
     workerIntervalSeconds: num("WORKER_INTERVAL_SECONDS", 15),
     syncIntervalMinutes: num("SYNC_INTERVAL_MINUTES", 15),
+    deviceStaleHours: num("DEVICE_STALE_HOURS", 48),
+    deviceZombieDays: num("DEVICE_ZOMBIE_DAYS", 14),
     cookieSecure: env("COOKIE_SECURE", appEnv === "production" ? "true" : "false") === "true",
   });
   if (cached.env === "production" && cached.mailProvider === "console") {

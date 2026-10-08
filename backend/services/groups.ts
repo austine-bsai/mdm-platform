@@ -1,9 +1,11 @@
 // Department / function groups: create, membership, and profile association.
 // Rule from the design notes: profiles reach devices ONLY through groups.
 import { db, run } from "../lib/db.ts";
-import { fail } from "../lib/errors.ts";
+import { fail, toAppError } from "../lib/errors.ts";
+import { log } from "../lib/log.ts";
 import * as zoho from "../zoho/api.ts";
 import type { Session } from "./auth.ts";
+import { requestGroupPasscodeReset } from "./commands.ts";
 import { type EventRow, raiseIfFailed, registerExecutor, submitOperation } from "./events.ts";
 import { getDevice, getDevices, getGroup, getProfiles, requireZohoId } from "./lookup.ts";
 
@@ -68,11 +70,13 @@ export async function removeDeviceFromGroup(s: Session, groupId: string, deviceI
 
 export async function removeDeviceFromAllGroups(s: Session, deviceId: string, idem: string | null) {
   await getDevice(s.enterpriseId, deviceId); // tenant check
-  const memberships = await run<{ groups: { id: string; name: string } }[]>(
+  type G = { id: string; name: string };
+  // PostgREST returns a to-one embed as an object; the generated type says array. Accept both.
+  const memberships = await run<{ groups: G | G[] }[]>(
     db().from("group_devices").select("groups!inner(id, name, enterprise_id)")
       .eq("device_id", deviceId).eq("groups.enterprise_id", s.enterpriseId),
   );
-  const groups = memberships.map((m) => ({ id: m.groups.id, name: m.groups.name }));
+  const groups = memberships.flatMap((m) => (Array.isArray(m.groups) ? m.groups : [m.groups])).map((g) => ({ id: g.id, name: g.name }));
   // Submit each group's removal independently so one stuck group does not block the others;
   // the HTTP layer reports per-event state. Per-(device,group) idempotency key keeps retries distinct.
   const results = await Promise.all(groups.map((g) =>
@@ -108,6 +112,28 @@ export async function disassociateProfiles(s: Session, groupId: string, profileI
   return await op(s, "group.disassociate_profiles", groupId, { profile_ids: profileIds }, idem);
 }
 
+/** Fan reset_passcode out to every enrolled member device in the group. */
+export async function resetPasscodeOnGroup(
+  s: Session,
+  groupId: string,
+  input: { passcode: string; emailUser: boolean; emailAdmin: boolean },
+  idem: string | null,
+) {
+  const g = await getGroup(s.enterpriseId, groupId);
+  const rows = await run<{ device_id: string }[]>(
+    db().from("group_devices").select("device_id, devices!inner(is_removed)")
+      .eq("group_id", groupId).eq("devices.is_removed", false),
+  );
+  const deviceIds = rows.map((r) => r.device_id);
+  if (!deviceIds.length) fail("CONFLICT", `Group "${g.name}" has no enrolled devices`);
+  // Two-step: nothing is sent until the emailed code + group name are confirmed.
+  return await requestGroupPasscodeReset(s, g, deviceIds, {
+    passcode: input.passcode,
+    email_sent_to_user: input.emailUser,
+    email_sent_to_admin: input.emailAdmin,
+  }, idem);
+}
+
 // ------------------------------------------------------------- executors
 async function zohoGroupId(ev: EventRow) {
   const g = await getGroup(ev.enterprise_id, ev.group_id!);
@@ -137,7 +163,21 @@ registerExecutor("group.add_devices", async (ev) => {
   const zgid = await zohoGroupId(ev);
   const ids = ev.params.device_ids as string[];
   const devices = await getDevices(ev.enterprise_id, ids);
-  await zoho.addGroupMembers(ev.enterprise_id, zgid, devices.map((d) => d.zoho_device_id));
+  // Zoho answers 409 "already exists in a group" for members it already has, which made
+  // harmless repeats land in the backlog. Add only the missing ones.
+  const memberKey = (m: Record<string, unknown>) => String(m.device_id ?? m.member_id ?? m.resource_id ?? "");
+  const current = new Set((await zoho.listGroupMembers(ev.enterprise_id, zgid)).map(memberKey));
+  const missing = devices.filter((d) => !current.has(String(d.zoho_device_id)));
+  if (missing.length) {
+    try {
+      await zoho.addGroupMembers(ev.enterprise_id, zgid, missing.map((d) => d.zoho_device_id));
+    } catch (e) {
+      // Raced with someone else adding them: fine if they're all members now.
+      const err = toAppError(e);
+      const now = new Set((await zoho.listGroupMembers(ev.enterprise_id, zgid)).map(memberKey));
+      if (!(err.code === "ZOHO_BAD_REQUEST" && missing.every((d) => now.has(String(d.zoho_device_id))))) throw e;
+    }
+  }
   await run(
     db().from("group_devices").upsert(devices.map((d) => ({ group_id: ev.group_id, device_id: d.id })), {
       onConflict: "group_id,device_id",
@@ -173,14 +213,27 @@ registerExecutor("group.delete", async (ev) => {
 registerExecutor("group.associate_profiles", async (ev) => {
   const zgid = await zohoGroupId(ev);
   const profiles = await getProfiles(ev.enterprise_id, ev.params.profile_ids as string[]);
-  await zoho.associateProfilesToGroup(ev.enterprise_id, zgid, profiles.map((p) => requireZohoId(p.zoho_profile_id, p.name)));
+  const zpids = profiles.map((p) => requireZohoId(p.zoho_profile_id, p.name));
+  await zoho.associateProfilesToGroup(ev.enterprise_id, zgid, zpids);
   await run(
     db().from("profile_groups").upsert(
       profiles.map((p) => ({ profile_id: p.id, group_id: ev.group_id, associated_by: ev.admin_id, source: "platform" })),
       { onConflict: "profile_id,group_id" },
     ),
   );
-  return { state: "succeeded", response: { associated: profiles.length } };
+  // Zoho's associate POST stores the link but devices only receive the policy on
+  // their next check-in. pushProfileUpdate forces an immediate push per profile.
+  // Non-fatal: on error we log and still return succeeded (link is correct).
+  const pushed: string[] = [];
+  for (const zpid of zpids) {
+    try {
+      await zoho.pushProfileUpdate(ev.enterprise_id, zpid);
+      pushed.push(zpid);
+    } catch (e) {
+      log("warn", "group.associate_push_failed", { enterprise_id: ev.enterprise_id, zoho_profile_id: zpid, error: String(e) });
+    }
+  }
+  return { state: "succeeded", response: { associated: profiles.length, pushed: pushed.length } };
 });
 
 registerExecutor("group.disassociate_profiles", async (ev) => {

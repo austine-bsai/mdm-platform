@@ -9,6 +9,7 @@ import { getConfig } from "./config.ts";
 import { db, run } from "./lib/db.ts";
 import { toAppError } from "./lib/errors.ts";
 import { log } from "./lib/log.ts";
+import { withLease } from "./lib/lease.ts";
 import { claimDue, processEvent, updateEvent } from "./services/events.ts";
 import { pollCommandStatus } from "./services/commands.ts";
 import { syncEnterprise } from "./services/sync.ts";
@@ -17,6 +18,7 @@ import { scanEnterprise } from "./services/security-scan.ts";
 import { pollEnterpriseLocations } from "./services/locations.ts";
 import "./services/groups.ts";
 import "./services/profiles.ts";
+import "./services/apps.ts";
 import "./services/announcements.ts";
 
 let ticking = false;
@@ -30,11 +32,22 @@ export async function tick(): Promise<void> {
     const { data: expired } = await db().rpc("expire_unconfirmed_events");
     if (expired) log("info", "worker.expired_confirmations", { count: expired });
 
-    for (const ev of await claimDue(["requested"], 20)) await processEvent(ev);
+    // One event per claim: a claim holds the row for 2 minutes, so claiming a batch of 20 and
+    // working through it serially could outlive the claim and let a second worker send it again.
+    for (let i = 0; i < 20; i++) {
+      const [ev] = await claimDue(["requested"], 1);
+      if (!ev) break;
+      await processEvent(ev);
+    }
 
-    for (const ev of await claimDue(["sent", "acknowledged"], 20)) {
+    for (let i = 0; i < 20; i++) {
+      const [ev] = await claimDue(["sent", "acknowledged"], 1);
+      if (!ev) break;
       if (ev.category !== "command") {
-        await updateEvent(ev.id, { locked_until: null, next_attempt_at: new Date(Date.now() + 365 * 86400_000).toISOString() });
+        await updateEvent(ev.id, {
+          locked_until: null,
+          next_attempt_at: new Date(Date.now() + 365 * 86400_000).toISOString(),
+        });
         continue;
       }
       try {
@@ -42,7 +55,10 @@ export async function tick(): Promise<void> {
       } catch (e) {
         const err = toAppError(e);
         log("warn", "worker.poll_failed", { event_id: ev.id, code: err.code });
-        await updateEvent(ev.id, { locked_until: null, next_attempt_at: new Date(Date.now() + 5 * 60_000).toISOString() });
+        await updateEvent(ev.id, {
+          locked_until: null,
+          next_attempt_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+        });
       }
     }
 
@@ -52,7 +68,9 @@ export async function tick(): Promise<void> {
       const conns = await run<{ enterprise_id: string }[]>(
         db().from("zoho_connections").select("enterprise_id").eq("status", "connected"),
       );
-      for (const c of conns) await syncEnterprise(c.enterprise_id);
+      for (const c of conns) {
+        await syncEnterprise(c.enterprise_id, undefined, null, { quietIfBusy: true });
+      }
     }
     await monitoringTick(cfg.syncIntervalMinutes);
   } catch (e) {
@@ -69,13 +87,20 @@ export async function monitoringTick(scanEveryMinutes: number) {
   );
   for (const { enterprise_id: eid } of conns) {
     try {
-      const st = await getSettings(eid);
-      const due = (iso: string | null, minutes: number) => !iso || Date.now() - Date.parse(iso) > minutes * 60_000;
-      if (due(st.last_security_scan_at, scanEveryMinutes)) await scanEnterprise(eid);
-      if (st.location_tracking_enabled && due(st.last_location_poll_at, st.location_interval_minutes)) {
-        await pollEnterpriseLocations(eid);
-      }
-      await checkAdminActivity(eid);
+      // One monitoring pass per enterprise across all processes.
+      await withLease(`monitor:${eid}`, 15 * 60, async () => {
+        const st = await getSettings(eid);
+        const due = (iso: string | null, minutes: number) =>
+          !iso || Date.now() - Date.parse(iso) > minutes * 60_000;
+        if (due(st.last_security_scan_at, scanEveryMinutes)) await scanEnterprise(eid);
+        if (
+          st.location_tracking_enabled &&
+          due(st.last_location_poll_at, st.location_interval_minutes)
+        ) {
+          await pollEnterpriseLocations(eid);
+        }
+        await checkAdminActivity(eid);
+      });
     } catch (e) {
       log("warn", "worker.monitoring_failed", { enterprise_id: eid, code: toAppError(e).code });
     }

@@ -256,7 +256,7 @@ function shell() {
     authScreen();
   };
 
-  const syncBtn = h("button", { class: "btn btn-sm", type: "button" }, icon("sync"), h("span", {}, "Sync now"));
+  const syncBtn = h("button", { class: "btn btn-sm", type: "button", "aria-label": "Sync now" }, icon("sync"), h("span", {}, "Sync now"));
   syncBtn.addEventListener("click", async () => {
     syncBtn.disabled = true;
     syncBtn.lastChild.textContent = "Syncing…";

@@ -4,7 +4,7 @@ import { isUuid, readJson, uuidParam } from "../lib/validate.ts";
 import { type AppEnv, requireRole, requireSession } from "../middleware/auth.ts";
 import { cancelEvent, retryEvent } from "../services/events.ts";
 import { type Resource, syncEnterprise } from "../services/sync.ts";
-import { eventResponse, intQuery, publicEvent } from "./helpers.ts";
+import { eventResponse, intQuery, publicEvent, redactEvents } from "./helpers.ts";
 
 const EVENT_COLUMNS =
   "id, category, action, state, error_code, error_message, attempts, max_attempts, params, response, action_time, sent_at, completed_at, next_attempt_at, device_id, group_id, profile_id, announcement_id, admins(email), devices(device_name), groups(name), profiles(name)";
@@ -28,7 +28,7 @@ export function eventRoutes() {
     if (category && CATEGORIES.includes(category)) q = q.eq("category", category);
     if (deviceId && isUuid(deviceId)) q = q.eq("device_id", deviceId);
     if (before && !Number.isNaN(Date.parse(before))) q = q.lt("action_time", new Date(before).toISOString());
-    return c.json({ data: await run(q) });
+    return c.json({ data: redactEvents(await run<Record<string, unknown>[]>(q), s.role) });
   });
 
   // Failure backlog: retries exhausted
@@ -36,17 +36,18 @@ export function eventRoutes() {
     const s = c.get("session");
     const data = await run(
       db().from("events").select(EVENT_COLUMNS).eq("enterprise_id", s.enterpriseId).in("state", ["dead", "failed"])
+        .not("category", "in", "(auth,sync)") // audit rows (e.g. a failed login) are not operations to fix
         .order("action_time", { ascending: false }).limit(200),
     );
-    return c.json({ data });
+    return c.json({ data: redactEvents(data as Record<string, unknown>[], s.role) });
   });
 
   r.get("/:id", async (c) => {
     const s = c.get("session");
-    const data = await run(
+    const data = await run<Record<string, unknown>>(
       db().from("events").select(EVENT_COLUMNS).eq("enterprise_id", s.enterpriseId).eq("id", uuidParam(c.req.param("id"))).single(),
     );
-    return c.json({ data });
+    return c.json({ data: redactEvents([data], s.role)[0] });
   });
 
   r.post("/:id/retry", requireRole("admin"), async (c) => {
@@ -68,7 +69,11 @@ export function overviewRoutes() {
 
   r.get("/overview", async (c) => {
     const eid = c.get("session").enterpriseId;
-    return c.json({ data: await run(db().rpc("enterprise_overview", { p_enterprise: eid })) });
+    const data = await run<Record<string, unknown>>(db().rpc("enterprise_overview", { p_enterprise: eid }));
+    // Same definition as the Backlog tab (failed or dead operations). Needs migration 008.
+    const { data: backlog, error } = await db().rpc("backlog_count", { p_enterprise: eid });
+    if (!error && backlog !== null) data.backlog = backlog;
+    return c.json({ data });
   });
 
   r.get("/sync-runs", async (c) => {

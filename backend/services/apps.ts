@@ -1,0 +1,215 @@
+// App distribution: install/uninstall Zoho-repository apps on groups + list
+// installed apps on a device. Follows the same event-executor pattern as
+// profiles — the HTTP route creates an event, the executor calls Zoho.
+import { db, run } from "../lib/db.ts";
+import { fail } from "../lib/errors.ts";
+import * as zoho from "../zoho/api.ts";
+import type { Session } from "./auth.ts";
+import { raiseIfFailed, registerExecutor, submitOperation } from "./events.ts";
+import { getDevice, getGroup, requireZohoId } from "./lookup.ts";
+
+export type AppInstallSpec = { appId: string; releaseLabelId?: string | null };
+
+const op = (s: Session, action: string, groupId: string, params: Record<string, unknown>, idem: string | null) =>
+  submitOperation({
+    enterpriseId: s.enterpriseId,
+    adminId: s.adminId,
+    category: "group",
+    action,
+    groupId,
+    params,
+    idempotencyKey: idem,
+  }).then((r) => ({ ...r, event: raiseIfFailed(r.event) }));
+
+export async function installAppsOnGroup(s: Session, groupId: string, apps: AppInstallSpec[], idem: string | null) {
+  if (!apps.length) fail("VALIDATION_FAILED", "Pick at least one app to install");
+  await getGroup(s.enterpriseId, groupId);
+  return await op(s, "group.install_apps", groupId, { apps }, idem);
+}
+
+export async function uninstallAppsFromGroup(s: Session, groupId: string, appIds: string[], idem: string | null) {
+  if (!appIds.length) fail("VALIDATION_FAILED", "Pick at least one app to remove");
+  await getGroup(s.enterpriseId, groupId);
+  return await op(s, "group.uninstall_apps", groupId, { app_ids: appIds }, idem);
+}
+
+/** Live from Zoho: what is installed on a specific device right now. */
+export async function deviceInstalledApps(s: Session, deviceId: string) {
+  const device = await getDevice(s.enterpriseId, deviceId);
+  const resp = await zoho.listDeviceApps(s.enterpriseId, device.zoho_device_id);
+  const list = (resp as { installed_apps?: unknown[] }).installed_apps ?? [];
+  return Array.isArray(list) ? list : [];
+}
+
+/**
+ * Union of installed apps across every enrolled member of the group. Deduped by
+ * package identifier. Each entry carries a `devices` count so the UI can show
+ * "installed on 2/3 devices".
+ */
+export async function groupInstalledApps(s: Session, groupId: string) {
+  await getGroup(s.enterpriseId, groupId);
+  // Supabase types `!inner(...)` as an array even for 1:1; cast and normalise.
+  const rows = await run<{ device_id: string; devices: unknown }[]>(
+    db().from("group_devices").select("device_id, devices!inner(id, zoho_device_id, is_removed)")
+      .eq("group_id", groupId).eq("devices.is_removed", false),
+  );
+  const zohoIds: string[] = [];
+  for (const r of rows) {
+    const d = Array.isArray(r.devices) ? r.devices[0] : r.devices;
+    const zid = (d as { zoho_device_id?: string } | undefined)?.zoho_device_id;
+    if (zid) zohoIds.push(String(zid));
+  }
+  if (!zohoIds.length) return [] as { identifier: string; app_name: string; platform_type: string; app_version?: string; devices: number }[];
+
+  type App = { identifier?: string; app_name?: string; platform_type?: string; app_version?: string };
+  const seen = new Map<string, { identifier: string; app_name: string; platform_type: string; app_version?: string; devices: number }>();
+  // Fetch 3-at-a-time to stay gentle on Zoho rate limits.
+  for (let i = 0; i < zohoIds.length; i += 3) {
+    const chunk = zohoIds.slice(i, i + 3);
+    const batches = await Promise.all(chunk.map(async (zid) => {
+      try {
+        const resp = await zoho.listDeviceApps(s.enterpriseId, zid);
+        const list = (resp as { installed_apps?: App[] }).installed_apps ?? [];
+        return Array.isArray(list) ? list : [];
+      } catch {
+        return [] as App[];
+      }
+    }));
+    for (const apps of batches) {
+      for (const a of apps) {
+        const id = a.identifier;
+        if (!id) continue;
+        const existing = seen.get(id);
+        if (existing) existing.devices += 1;
+        else seen.set(id, {
+          identifier: id,
+          app_name: a.app_name ?? id,
+          platform_type: String(a.platform_type ?? "android"),
+          app_version: a.app_version,
+          devices: 1,
+        });
+      }
+    }
+  }
+  return [...seen.values()].sort((a, b) => a.app_name.localeCompare(b.app_name));
+}
+
+// ---------------------------------------------------------------- executors
+async function zohoGroupId(enterpriseId: string, groupId: string): Promise<string> {
+  const g = await getGroup(enterpriseId, groupId);
+  return requireZohoId(g.zoho_group_id, `Group "${g.name}"`);
+}
+
+/**
+ * If the caller didn't supply release_label_id, fetch the app detail and pick
+ * the first (Stable / Production) label. Avoids making the UI mandatory.
+ */
+async function resolveReleaseLabel(enterpriseId: string, appId: string, provided?: string | null): Promise<string> {
+  if (provided) return String(provided);
+  const detail = await zoho.getAppDetail(enterpriseId, appId) as { release_labels?: { release_label_id?: string | number }[] };
+  const labels = detail.release_labels ?? [];
+  if (!labels.length) fail("VALIDATION_FAILED", `App ${appId} has no release labels in Zoho`);
+  return String(labels[0].release_label_id);
+}
+
+registerExecutor("group.install_apps", async (ev) => {
+  const zgid = await zohoGroupId(ev.enterprise_id, ev.group_id!);
+  const apps = ev.params.apps as AppInstallSpec[];
+  const resolved: { app_id: string; release_label_id: string }[] = [];
+  for (const a of apps) {
+    resolved.push({ app_id: String(a.appId), release_label_id: await resolveReleaseLabel(ev.enterprise_id, String(a.appId), a.releaseLabelId) });
+  }
+  await zoho.installAppsOnGroup(ev.enterprise_id, zgid, resolved, { silent_install: true });
+  return { state: "succeeded", response: { installed: resolved.length } };
+});
+
+registerExecutor("group.uninstall_apps", async (ev) => {
+  const zgid = await zohoGroupId(ev.enterprise_id, ev.group_id!);
+  const appIds = (ev.params.app_ids as string[]).map(String);
+  await zoho.uninstallAppsFromGroup(ev.enterprise_id, zgid, appIds);
+  return { state: "succeeded", response: { removed: appIds.length } };
+});
+
+// ------------------------------------------------------------ app blacklist
+export type BlacklistEntry = { identifier: string; platform: number; appname: string };
+
+export const listBlacklistApps = (s: Session) => zoho.listBlacklistApps(s.enterpriseId);
+
+export async function blacklistAppsOnGroup(s: Session, groupId: string, entries: BlacklistEntry[], idem: string | null) {
+  if (!entries.length) fail("VALIDATION_FAILED", "Pick at least one app to blacklist");
+  await getGroup(s.enterpriseId, groupId);
+  return await op(s, "group.blacklist_apps", groupId, { entries }, idem);
+}
+
+export async function removeBlacklistFromGroup(s: Session, groupId: string, appGroupIds: string[], idem: string | null) {
+  if (!appGroupIds.length) fail("VALIDATION_FAILED", "Pick at least one app to unblock");
+  await getGroup(s.enterpriseId, groupId);
+  return await op(s, "group.remove_blacklist", groupId, { app_group_ids: appGroupIds }, idem);
+}
+
+/**
+ * Zoho's /blacklist/devices expects device IDs, not group IDs. Resolve the
+ * group's current enrolled member device IDs so we can fan the blacklist across
+ * them. Returns the Zoho device IDs.
+ */
+async function groupMemberZohoIds(enterpriseId: string, groupId: string): Promise<string[]> {
+  const rows = await run<{ device_id: string; devices: unknown }[]>(
+    db().from("group_devices").select("device_id, devices!inner(zoho_device_id, is_removed)")
+      .eq("group_id", groupId).eq("devices.is_removed", false),
+  );
+  const ids: string[] = [];
+  for (const r of rows) {
+    const d = Array.isArray(r.devices) ? r.devices[0] : r.devices;
+    const zid = (d as { zoho_device_id?: string } | undefined)?.zoho_device_id;
+    if (zid) ids.push(String(zid));
+  }
+  return ids;
+}
+
+registerExecutor("group.blacklist_apps", async (ev) => {
+  await zohoGroupId(ev.enterprise_id, ev.group_id!); // tenant + existence check
+  const deviceZids = await groupMemberZohoIds(ev.enterprise_id, ev.group_id!);
+  if (!deviceZids.length) fail("CONFLICT", "Group has no enrolled devices to apply the blacklist to");
+  const entries = ev.params.entries as BlacklistEntry[];
+  // Step 1: register apps in the blacklist repo (idempotent; Zoho dedupes by identifier).
+  // The response has { apps: [{ appgroupid, identifier, ... }] }. We also need existing
+  // appgroupids for entries that already exist in the repo, so merge with the list.
+  const addResp = await zoho.addBlacklistApp(ev.enterprise_id, entries) as { apps?: { appgroupid?: string | number; identifier?: string }[] };
+  const added = addResp.apps ?? [];
+  const existing = ((await zoho.listBlacklistApps(ev.enterprise_id)) as { apps?: { appgroupid?: string | number; identifier?: string }[] }).apps ?? [];
+  const byIdentifier = new Map<string, string>();
+  for (const row of [...existing, ...added]) {
+    if (row.identifier && row.appgroupid) byIdentifier.set(String(row.identifier), String(row.appgroupid));
+  }
+  const appGroupIds = entries.map((e) => byIdentifier.get(e.identifier)).filter((x): x is string => !!x);
+  if (!appGroupIds.length) fail("ZOHO_BAD_REQUEST", "Could not resolve appgroupids for blacklist entries");
+  // Step 2: apply to every member device of the group (Zoho's endpoint is device-scoped).
+  await zoho.applyBlacklistToResources(ev.enterprise_id, deviceZids, appGroupIds);
+  return { state: "succeeded", response: { blacklisted: appGroupIds.length, devices: deviceZids.length, app_group_ids: appGroupIds } };
+});
+
+registerExecutor("group.remove_blacklist", async (ev) => {
+  await zohoGroupId(ev.enterprise_id, ev.group_id!);
+  const deviceZids = await groupMemberZohoIds(ev.enterprise_id, ev.group_id!);
+  const appGroupIds = (ev.params.app_group_ids as string[]).map(String);
+  if (!deviceZids.length) return { state: "succeeded", response: { unblocked: 0, note: "Group has no enrolled devices" } };
+  try {
+    await zoho.removeBlacklistFromResources(ev.enterprise_id, deviceZids, appGroupIds);
+  } catch (e) {
+    // Zoho returns 404 when the appgroupid wasn't actually applied to these devices.
+    if ((e as { code?: string }).code !== "ZOHO_NOT_FOUND") throw e;
+    return { state: "succeeded", response: { unblocked: 0, note: "Was not applied to this group's devices" } };
+  }
+  return { state: "succeeded", response: { unblocked: appGroupIds.length, devices: deviceZids.length } };
+});
+
+/**
+ * Nuke apps from the enterprise blacklist repo entirely (not just per-group).
+ * Direct call — no event wrapper because this is a one-shot admin cleanup with
+ * no retry semantics. Returns Zoho's response for the caller to inspect.
+ */
+export async function deleteFromBlacklistRepo(s: Session, appGroupIds: string[]) {
+  if (!appGroupIds.length) fail("VALIDATION_FAILED", "appGroupIds[] required");
+  return await zoho.deleteBlacklistApp(s.enterpriseId, appGroupIds);
+}
+

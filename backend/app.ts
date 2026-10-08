@@ -18,6 +18,7 @@ import { alertRoutes, locationRoutes, monitoringRoutes } from "./routes/monitori
 import "./services/commands.ts";
 import "./services/groups.ts";
 import "./services/profiles.ts";
+import "./services/apps.ts";
 import "./services/announcements.ts";
 
 export function buildApp(opts: { staticRoot?: string } = {}) {

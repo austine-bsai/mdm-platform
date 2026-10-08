@@ -1,10 +1,14 @@
 // Profiles: one purpose per profile (restrictions, kiosk, passcode/wipe, FRP, custom).
 // Flow from the guide: create profile -> add payload(s) -> publish -> associate to groups.
 import { db, run } from "../lib/db.ts";
-import { fail } from "../lib/errors.ts";
+import { fail, toAppError } from "../lib/errors.ts";
 import * as zoho from "../zoho/api.ts";
 import {
   ANDROID_RESTRICTIONS,
+  type AppProfileEntry,
+  type BlacklistProfileEntry,
+  buildAppBlacklistPayload,
+  buildAppsPayload,
   buildFrpPayload,
   buildKioskPayload,
   buildPasscodePayload,
@@ -45,9 +49,22 @@ export function buildPayload(platform: "android" | "ios", purpose: Purpose, conf
           mode: config.mode === "multi" ? "multi" : "single",
           apps: (config.apps ?? []) as KioskApp[],
           allowStatusBar: config.allowStatusBar as boolean | undefined,
+          allowStatusBarExpansion: config.allowStatusBarExpansion as boolean | undefined,
           allowHomeButton: config.allowHomeButton as boolean | undefined,
           allowBackButton: config.allowBackButton as boolean | undefined,
           allowPowerButton: config.allowPowerButton as boolean | undefined,
+          allowVolumeButton: config.allowVolumeButton as boolean | undefined,
+          allowShutdown: config.allowShutdown as boolean | undefined,
+          allowKeyGuard: config.allowKeyGuard as boolean | undefined,
+          allowNotification: config.allowNotification as boolean | undefined,
+          allowRecentApps: config.allowRecentApps as boolean | undefined,
+          allowTaskManager: config.allowTaskManager as boolean | undefined,
+          allowSystemErrorDialog: config.allowSystemErrorDialog as boolean | undefined,
+          allowCustomSettings: config.allowCustomSettings as boolean | undefined,
+          showMeMdmApp: config.showMeMdmApp as boolean | undefined,
+          launcherType: config.launcherType as 1 | 2 | undefined,
+          screenOrientation: config.screenOrientation as 1 | 2 | 3 | 4 | undefined,
+          screenTimeout: config.screenTimeout as number | undefined,
           extra: (config.extra ?? {}) as Record<string, unknown>,
         }),
       };
@@ -60,6 +77,12 @@ export function buildPayload(platform: "android" | "ios", purpose: Purpose, conf
           maxFailedAttempts: config.maxFailedAttempts as number | undefined,
           autoLockSeconds: config.autoLockSeconds as number | undefined,
           maxAgeDays: config.maxAgeDays as number | undefined,
+          scope: config.scope as number | undefined,
+          gracePeriodMinutes: config.gracePeriodMinutes as number | undefined,
+          allowFingerprint: config.allowFingerprint as number | undefined,
+          allowFaceUnlock: config.allowFaceUnlock as boolean | undefined,
+          allowIrisScan: config.allowIrisScan as boolean | undefined,
+          allowOneLock: config.allowOneLock as boolean | undefined,
         }),
       };
     case "frp":
@@ -117,7 +140,15 @@ export async function createProfile(s: Session, input: {
 export async function addPolicy(s: Session, profileId: string, purpose: Purpose, config: Record<string, unknown>, idem: string | null) {
   const p = await getProfile(s.enterpriseId, profileId);
   if (p.state === "deleted") fail("CONFLICT", "Profile is deleted");
-  const payload = buildPayload(p.platform, purpose, config);
+  let payload;
+  try {
+    payload = buildPayload(p.platform, purpose, config);
+  } catch (e) {
+    // Surface *what* the client sent so a VALIDATION_FAILED is debuggable from logs.
+    const { log } = await import("../lib/log.ts");
+    log("warn", "profile.add_policy_validation_failed", { profile_id: profileId, purpose, config, error: String(e) });
+    throw e;
+  }
   await run(
     db().from("profiles").update({
       payload_names: [...new Set([...p.payload_names, payload.name])],
@@ -129,7 +160,13 @@ export async function addPolicy(s: Session, profileId: string, purpose: Purpose,
 }
 
 export const publishProfile = (s: Session, profileId: string, idem: string | null) =>
-  getProfile(s.enterpriseId, profileId).then(() => op(s, "profile.publish", profileId, {}, idem));
+  getProfile(s.enterpriseId, profileId).then((p) => {
+    // Zoho rejects it anyway ("Empty Profile cannot be published"); say so before queueing.
+    if (!(p as { payload_names?: string[] | null }).payload_names?.length) {
+      fail("VALIDATION_FAILED", `"${p.name}" has no policies yet. Add at least one policy before publishing.`);
+    }
+    return op(s, "profile.publish", profileId, {}, idem);
+  });
 
 export const deleteProfile = (s: Session, profileId: string, idem: string | null) =>
   getProfile(s.enterpriseId, profileId).then(() => op(s, "profile.delete", profileId, {}, idem));
@@ -195,8 +232,35 @@ registerExecutor("profile.publish", async (ev) => {
 
 registerExecutor("profile.delete", async (ev) => {
   const p = await getProfile(ev.enterprise_id, ev.profile_id!);
-  if (p.zoho_profile_id) await zoho.deleteProfiles(ev.enterprise_id, [p.zoho_profile_id]);
+  let zohoDeleted = false;
+  if (p.zoho_profile_id) {
+    // Take it off its groups first so devices stop receiving it cleanly.
+    const links = await run<{ groups: { zoho_group_id: string | null } | { zoho_group_id: string | null }[] | null }[]>(
+      db().from("profile_groups").select("groups(zoho_group_id)").eq("profile_id", p.id),
+    );
+    for (const l of links) {
+      for (const g of Array.isArray(l.groups) ? l.groups : l.groups ? [l.groups] : []) {
+        if (g.zoho_group_id) await zoho.disassociateProfilesFromGroup(ev.enterprise_id, g.zoho_group_id, [p.zoho_profile_id]).catch(() => {});
+      }
+    }
+    try {
+      await zoho.deleteProfiles(ev.enterprise_id, [p.zoho_profile_id]);
+      zohoDeleted = true;
+    } catch (e) {
+      const err = toAppError(e);
+      // Zoho's public API refuses permanent-delete unless the profile is already
+      // in Zoho's Trash — and there's no public endpoint to trash. Soft-delete
+      // locally so the UI hides it immediately; the row stays `state='deleted'`
+      // and syncProfiles preserves that even when Zoho still reports Published.
+      if (!/COM0015|moved to trash/i.test(`${err.message} ${JSON.stringify(err.details ?? "")}`)) throw e;
+    }
+  }
   await run(db().from("profile_groups").delete().eq("profile_id", p.id));
   await run(db().from("profiles").update({ state: "deleted" }).eq("id", p.id));
-  return { state: "succeeded" };
+  return {
+    state: "succeeded",
+    response: zohoDeleted
+      ? { deleted_in_zoho: true }
+      : { deleted_in_zoho: false, note: "Hidden locally. Still exists in Zoho — move to Trash in Zoho console to delete permanently." },
+  };
 });

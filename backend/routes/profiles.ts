@@ -12,6 +12,7 @@ import {
   PURPOSES,
 } from "../services/profiles.ts";
 import { listApps } from "../zoho/api.ts";
+import { deleteFromBlacklistRepo, listBlacklistApps } from "../services/apps.ts";
 import { eventResponse } from "./helpers.ts";
 
 export function profileRoutes() {
@@ -71,5 +72,14 @@ export function appRoutes() {
   r.use("*", requireSession);
   // Live from Zoho: used by the kiosk builder to pick apps (app_id + package name).
   r.get("/", async (c) => c.json({ data: await listApps(c.get("session").enterpriseId) }));
+  r.get("/blacklist", async (c) => c.json({ data: await listBlacklistApps(c.get("session")) }));
+  // Nuke apps from the enterprise blacklist repo entirely. Owner-only since
+  // this affects every group that has those apps blacklisted.
+  r.delete("/blacklist", requireRole("owner"), async (c) => {
+    const b = await readJson(c.req.raw);
+    const ids = Array.isArray(b.appGroupIds) ? b.appGroupIds.map(String) : [];
+    const data = await deleteFromBlacklistRepo(c.get("session"), ids);
+    return c.json({ data });
+  });
   return r;
 }

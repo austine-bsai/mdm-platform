@@ -27,6 +27,7 @@ export const ERROR_CATALOG = {
   COMMAND_CONFIRMATION_REQUIRED: { status: 202, message: "This action needs a second confirmation.", retryable: false },
   COMMAND_CONFIRMATION_INVALID: { status: 400, message: "Confirmation details do not match.", retryable: false },
   COMMAND_CONFIRMATION_EXPIRED: { status: 410, message: "Confirmation window expired.", retryable: false },
+  SYNC_IN_PROGRESS: { status: 409, message: "A sync is already running for this enterprise. Try again in a minute.", retryable: true },
   DIRECT_PROFILE_DEVICE_BLOCKED: { status: 400, message: "Profiles are applied through groups only.", retryable: false },
   PROFILE_NOT_PUBLISHED: { status: 409, message: "Publish the profile before associating it.", retryable: false },
   TRACKING_DISABLED: { status: 409, message: "Location tracking is turned off for this enterprise.", retryable: false },

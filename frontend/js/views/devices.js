@@ -1,9 +1,38 @@
 import { get, newIdempotencyKey, post } from "../api.js";
+import { confirmDestructive, DESTRUCTIVE } from "../confirm.js";
 import { ago, badge, clear, emptyState, field, fmtTime, h, icon, input, jsonBlock, loading, modal, pageHeader, select, table, toast, toastError, toastEvent } from "../ui.js";
 
 let actionsCache = null;
 const actions = async () => (actionsCache ??= await get("/api/devices/actions"));
-const platformName = (p) => (p === "ios" ? "Apple" : p === "android" ? "Android" : p ?? "—");
+const platformName = (p) => ({ ios: "Apple", android: "Android", macos: "macOS", windows: "Windows", chrome: "ChromeOS" }[p] ?? p ?? "—");
+
+// Device is "stale" when it hasn't checked in to Zoho for > STALE_HOURS.
+// Match the backend DEVICE_STALE_HOURS default. Only shown for not-removed devices.
+const STALE_HOURS = 48;
+const isStale = (d) => {
+  if (d.is_removed || !d.last_contact_at) return false;
+  const ms = Date.now() - Date.parse(d.last_contact_at);
+  return ms > STALE_HOURS * 3600_000;
+};
+
+// Management mode: which authority the MDM agent has on the device.
+// Returned as { label, tone, hint } or null if unknown. Hint explains what the
+// mode can/can't enforce — surfaces WHY a policy might not apply to this device.
+function adminMode(d) {
+  if (d.is_profileowner === true) {
+    return { label: "work profile", tone: "info", hint: "Agent only controls the work-profile container. Device-wide restrictions won't apply." };
+  }
+  if (d.is_supervised === true) {
+    return { label: "supervised", tone: "ok", hint: "Agent has device-wide authority. All profile restrictions should apply." };
+  }
+  if (d.owned_by === 2) {
+    return { label: "personal", tone: "warn", hint: "BYOD / personal device. Most device-wide restrictions won't apply." };
+  }
+  if (d.is_supervised === false) {
+    return { label: "unmanaged", tone: "warn", hint: "Agent lacks supervision. Many restrictions silently ignored by Android." };
+  }
+  return null;
+}
 
 // ------------------------------------------------------------------ list
 export async function devicesView(el, ctx, params) {
@@ -42,13 +71,18 @@ export async function devicesView(el, ctx, params) {
         type: "checkbox", "aria-label": `Select ${d.device_name}`, checked: selected.has(d.id),
         onchange: (e) => { e.target.checked ? selected.add(d.id) : selected.delete(d.id); refreshSel(); },
       }) } : null,
-      { label: "Device", primary: true, cell: (d) => h("div", {},
-        h("a", { class: "link", href: `#/devices/${d.id}` }, d.device_name ?? "Unnamed"),
-        d.is_lost_mode ? [" ", badge("lost mode", "warn")] : null,
-        h("div", { class: "cell-sub" }, `${platformName(d.platform)} · ${d.model ?? "unknown model"}`)) },
+      { label: "Device", primary: true, cell: (d) => {
+        const mode = adminMode(d);
+        return h("div", {},
+          h("a", { class: "link", href: `#/devices/${d.id}` }, d.device_name ?? "Unnamed"),
+          d.is_lost_mode ? [" ", badge("lost mode", "warn")] : null,
+          isStale(d) ? [" ", badge("stale", "warn")] : null,
+          mode ? [" ", h("span", { title: mode.hint }, badge(mode.label, mode.tone))] : null,
+          h("div", { class: "cell-sub" }, `${platformName(d.platform)} · ${d.model ?? "unknown model"}`));
+      } },
       { label: "User", cell: (d) => d.mdm_users?.user_name ?? h("span", { class: "muted" }, "Unassigned") },
       { label: "Groups", cell: (d) => (d.group_devices ?? []).length ? h("span", { class: "chips" }, d.group_devices.map((g) => badge(g.groups?.name ?? "", g.groups?.kind === "function" ? "info" : "muted"))) : h("span", { class: "muted" }, "None") },
-      { label: "Synced", cell: (d) => h("span", { class: "muted nowrap" }, ago(d.last_synced_at)) },
+      { label: "Last seen", cell: (d) => h("span", { class: isStale(d) ? "warn nowrap" : "muted nowrap" }, d.last_contact_at ? ago(d.last_contact_at) : "never") },
     ].filter(Boolean);
     clear(tableBox,
       h("p", { class: "muted small" }, `${rows.length} of ${devices.length} devices`),
@@ -70,7 +104,8 @@ export async function devicesView(el, ctx, params) {
     ]);
   }
   async function bulkCmd() {
-    const list = (await actions()).filter((a) => !a.confirm && ctx.can(a.minRole));
+    // Never offer wipes/passcodes in bulk, even if the server's flags were changed.
+    const list = (await actions()).filter((a) => !a.confirm && !DESTRUCTIVE.has(a.id) && !/kiosk/.test(a.id) && ctx.can(a.minRole));
     const pick = select(list.map((a) => ({ value: a.id, label: a.label })));
     modal(`Command for ${selected.size} device(s)`, field("Action", pick, "Wipe and passcode actions run one device at a time from the device page."), [
       { label: "Cancel" },
@@ -100,11 +135,22 @@ export async function deviceDetailView(el, ctx, id) {
     actions(),
     get(`/api/alerts?status=active&device_id=${encodeURIComponent(id)}`).catch(() => []),
   ]);
-  const allowed = acts.filter((a) => ctx.can(a.minRole));
-  const safe = allowed.filter((a) => !a.confirm);
-  const danger = allowed.filter((a) => a.confirm);
+  // Only show actions the device's platform supports — Zoho otherwise answers
+  // COM0007 "Command not applicable for Device". Android shutdown/restart need Samsung Knox.
+  const supports = (a) => {
+    if (!a.platforms?.length) return true;
+    if (!a.platforms.includes(d.platform)) return false;
+    if (d.platform === "android" && a.knoxOnlyAndroid && !d.is_knox) return false;
+    return true;
+  };
+  const allowed = acts.filter((a) => ctx.can(a.minRole) && supports(a));
+  const isDanger = (a) => a.confirm || DESTRUCTIVE.has(a.id);
+  // Kiosk commands only when one of the device's groups gives it a kiosk profile (Zoho rejects them otherwise).
+  const safe = allowed.filter((a) => !isDanger(a) && (d.kiosk || !/kiosk/.test(a.id)));
+  const danger = allowed.filter(isDanger);
   const reload = () => deviceDetailView(el, ctx, id);
   const historyBox = h("div");
+  const appsBox = h("div");
 
   const facts = [
     ["Platform", platformName(d.platform)],
@@ -112,11 +158,16 @@ export async function deviceDetailView(el, ctx, id) {
     ["OS version", d.os_version],
     ["User", d.mdm_users ? [d.mdm_users.user_name, d.mdm_users.email].filter(Boolean).join(" · ") : "Unassigned"],
     ["Ownership", d.owned_by === 1 ? "Corporate" : d.owned_by === 2 ? "Personal (work profile)" : "—"],
+    ["Management mode", (() => {
+      const m = adminMode(d);
+      return m ? [badge(m.label, m.tone), h("div", { class: "muted small" }, m.hint)] : h("span", { class: "muted" }, "unknown");
+    })()],
     ["IMEI", d.imei],
     ["Serial", d.serial_number],
     ["Zoho device id", d.zoho_device_id],
     ["Enrolled", fmtTime(d.added_at)],
-    ["Last synced", ago(d.last_synced_at)],
+    ["Last contact (device → Zoho)", d.last_contact_at ? [ago(d.last_contact_at), isStale(d) ? [" ", badge("stale", "warn")] : null] : h("span", { class: "muted" }, "never")],
+    ["Last synced (Zoho → us)", ago(d.last_synced_at)],
   ];
 
   clear(
@@ -145,6 +196,26 @@ export async function deviceDetailView(el, ctx, id) {
           h("div", { class: "action-grid" }, safe.map((a) => h("button", { class: "btn", type: "button", onclick: () => runAction(d, a, reload) }, a.label))),
         ) : null,
         h("section", { class: "card" },
+          h("div", { class: "card-head" }, h("h2", {}, "Installed apps")),
+          h("p", { class: "muted small" }, "Live from Zoho when loaded. Not stored locally."),
+          h("div", { class: "btn-row" }, h("button", { class: "btn btn-sm", type: "button", onclick: async () => {
+            clear(appsBox, loading());
+            try {
+              const apps = await get(`/api/devices/${id}/apps`);
+              clear(appsBox, apps.length
+                ? h("ul", { class: "list" }, apps.map((a) => h("li", {},
+                  h("strong", {}, a.app_name ?? "App"),
+                  h("span", { class: "muted small" }, ` · ${a.identifier ?? ""} · v${a.app_version ?? "?"}`),
+                )))
+                : h("p", { class: "muted" }, "No apps reported for this device."));
+            } catch (err) {
+              clear(appsBox);
+              toastError(err);
+            }
+          } }, "Fetch installed apps")),
+          appsBox,
+        ),
+        h("section", { class: "card" },
           h("div", { class: "card-head" }, h("h2", {}, "Recent events"), h("a", { href: "#/activity" }, "All activity")),
           d.events.length
             ? h("ul", { class: "feed" }, d.events.slice(0, 15).map((e) => h("li", {}, badge(e.state), h("span", { class: "feed-action" }, e.action.replace(/_/g, " ")), e.error_message ? h("span", { class: "muted small" }, e.error_message) : null, h("span", { class: "muted feed-time" }, ago(e.action_time)))))
@@ -169,7 +240,7 @@ export async function deviceDetailView(el, ctx, id) {
         ),
         danger.length ? h("section", { class: "card danger-zone" },
           h("div", { class: "card-head" }, h("h2", {}, "Destructive actions")),
-          h("p", { class: "muted small" }, "Each needs an emailed code and the device name typed in full."),
+          h("p", { class: "muted small" }, `Each needs a code from your email and the last 4 characters of the ${d.confirm_tag?.source ?? "serial number"}, so two phones with the same name can't be mixed up.`),
           h("div", { class: "btn-row" }, danger.map((a) => h("button", { class: "btn btn-sm btn-danger", type: "button", onclick: () => runAction(d, a, reload) }, a.label))),
         ) : null,
       ),
@@ -178,17 +249,23 @@ export async function deviceDetailView(el, ctx, id) {
 }
 
 function runAction(device, action, done) {
-  const params = {};
   const extra = [];
+  const get = [];
   if (action.params.includes("lock_message")) {
     const msg = input({ maxlength: 200, placeholder: "e.g. This phone belongs to Acme. Call +255…" });
     extra.push(field("Lock-screen message", msg));
-    params.get = () => (msg.value ? { lock_message: msg.value } : {});
+    get.push(() => (msg.value ? { lock_message: msg.value } : {}));
   }
+  if (action.id === "reset_passcode") {
+    const pw = input({ type: "password", minlength: 4, maxlength: 16, autocomplete: "new-password", placeholder: "4–16 characters" });
+    extra.push(field("New passcode", pw, "Leave empty to let Zoho clear it so the user sets a new one."));
+    get.push(() => (pw.value ? { passcode: pw.value, email_sent_to_user: true } : {}));
+  }
+  const params = () => Object.assign({}, ...get.map((g) => g()));
 
-  if (!action.confirm) {
+  if (!action.confirm && !DESTRUCTIVE.has(action.id)) {
     const go = async () => {
-      const res = await post("/api/commands", { deviceIds: [device.id], action: action.id, params: params.get?.() ?? {} });
+      const res = await post("/api/commands", { deviceIds: [device.id], action: action.id, params: params() });
       toastEvent(res, `${action.label} sent`);
       done?.();
     };
@@ -196,34 +273,20 @@ function runAction(device, action, done) {
     return modal(action.label, h("div", { class: "stack" }, extra), [{ label: "Cancel" }, { label: "Send", tone: "primary", onClick: go }]);
   }
 
-  // Two-step: request -> email code -> type device name + code
+  // Two-step: (1) server emails a code to your sign-in email, (2) code + serial tail (confirm.js).
   const idem = newIdempotencyKey();
+  const tag = device.confirm_tag;
   modal(`${action.label}?`, h("div", { class: "stack" },
-    h("p", {}, `This runs "${action.label}" on `, h("strong", {}, device.device_name), ". ", action.id === "complete_wipe" ? "All data on the device is erased." : ""),
-    h("p", { class: "muted" }, "Step 1 of 2: we email you a confirmation code."),
+    h("p", {}, `This runs "${action.label}" on `, h("strong", {}, device.device_name ?? "this device"),
+      tag ? ` (${tag.source} ending ${tag.tag})` : "", ". ",
+      action.id === "complete_wipe" ? "Everything on the phone is erased and cannot be recovered." : ""),
+    ...extra,
+    h("p", { class: "muted" }, "Step 1 of 2: we email a confirmation code to your sign-in email."),
   ), [
     { label: "Cancel" },
     { label: "Email me the code", tone: "danger", onClick: async () => {
-      const res = await post("/api/commands", { deviceIds: [device.id], action: action.id }, { idem });
-      confirmStep(device, action, res.data.events[0].id, done);
+      const res = await post("/api/commands", { deviceIds: [device.id], action: action.id, params: params() }, { idem });
+      confirmDestructive(res, action.label, () => done?.());
     } },
   ]);
 }
-
-function confirmStep(device, action, eventId, done) {
-  const name = input({ autocomplete: "off", placeholder: device.device_name });
-  const code = input({ inputmode: "numeric", maxlength: 6, autocomplete: "one-time-code" });
-  modal(`Confirm ${action.label}`, h("div", { class: "stack" },
-    h("p", {}, "Step 2 of 2. Type the device name exactly and the code from your email."),
-    field("Device name", name),
-    field("Confirmation code", code),
-  ), [
-    { label: "Cancel", onClick: () => post(`/api/events/${eventId}/cancel`, {}).then(() => toast("Cancelled", "info")).catch(() => {}) },
-    { label: action.label, tone: "danger", onClick: async () => {
-      toastEvent(await post(`/api/commands/${eventId}/confirm`, { code: code.value.trim(), deviceName: name.value }), `${action.label} sent`);
-      done?.();
-    } },
-  ]);
-}
-
-

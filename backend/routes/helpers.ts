@@ -12,7 +12,26 @@ export function eventResponse(c: Context, event: EventRow | EventRow[], extra: R
 
 export function publicEvent(e: EventRow) {
   const { confirm_code_hash: _h, locked_until: _l, ...rest } = e;
-  return rest;
+  return { ...rest, params: redactParams(rest.params as Record<string, unknown> | null) };
+}
+
+// Secrets never leave the server; contact details only for owners/admins.
+const SECRET_KEY = /passcode|password|secret|token|_enc$/i;
+const CONTACT_KEY = /phone|email_address|user_email/i;
+
+export function redactParams(p: Record<string, unknown> | null | undefined, role: Role = "admin") {
+  if (!p || typeof p !== "object") return p ?? {};
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(p)) {
+    if (SECRET_KEY.test(k)) out[k.replace(/_enc$/, "")] = "[hidden]";
+    else if (role === "viewer" && CONTACT_KEY.test(k)) out[k] = "[hidden]";
+    else out[k] = v;
+  }
+  return out;
+}
+
+export function redactEvents<T extends Record<string, unknown>>(rows: T[], role: Role): T[] {
+  return rows.map((r) => ("params" in r ? { ...r, params: redactParams(r.params as Record<string, unknown>, role) } : r));
 }
 
 const mask = (v: unknown) => (v ? `••••${String(v).slice(-4)}` : null);

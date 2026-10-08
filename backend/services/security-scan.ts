@@ -69,6 +69,16 @@ async function scanDevice(eid: string, d: Device, offlineHours: number, factor: 
   const c = evaluateSecurity({ security, lastContactAt, offlineHours });
   const name = d.device_name ?? String(d.zoho_device_id);
 
+  // Backfill the devices table with fields that only exist on the detail endpoint.
+  // is_profileowner is not on /devices list, so without this scan the badge logic
+  // falls back to owned_by + is_supervised only.
+  if (details.is_profileowner !== undefined || details.is_supervised !== undefined) {
+    await db().from("devices").update({
+      is_profileowner: details.is_profileowner === undefined ? null : asBool(details.is_profileowner),
+      is_supervised: details.is_supervised === undefined ? null : asBool(details.is_supervised),
+    }).eq("id", d.id);
+  }
+
   await run(db().from("device_snapshots").upsert({
     device_id: d.id,
     enterprise_id: eid,

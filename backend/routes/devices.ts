@@ -3,7 +3,8 @@ import { db, run } from "../lib/db.ts";
 import { fail } from "../lib/errors.ts";
 import { obj, readJson, str, uuidList, uuidParam } from "../lib/validate.ts";
 import { type AppEnv, idempotencyKey, requireRole, requireSession } from "../middleware/auth.ts";
-import { confirmCommand, DEVICE_ACTIONS, requestCommand } from "../services/commands.ts";
+import { confirmationTarget, confirmCommand, DEVICE_ACTIONS, deviceHasKiosk, deviceTag, requestCommand } from "../services/commands.ts";
+import { deviceInstalledApps } from "../services/apps.ts";
 import { clearDeviceCommands, recordAudit } from "../services/events.ts";
 import { removeDeviceFromAllGroups } from "../services/groups.ts";
 import { getDevice } from "../services/lookup.ts";
@@ -12,7 +13,7 @@ import { zohoRequest } from "../zoho/client.ts";
 import { eventResponse, intQuery, maskDevice } from "./helpers.ts";
 
 const DEVICE_COLUMNS =
-  "id, zoho_device_id, platform, device_name, model, product_name, os_version, serial_number, imei, owned_by, is_lost_mode, is_removed, added_at, last_synced_at, mdm_users(id, user_name, email), group_devices(groups(id, name, kind))";
+  "id, zoho_device_id, platform, device_name, model, product_name, os_version, serial_number, imei, owned_by, is_lost_mode, is_removed, is_supervised, is_profileowner, is_knox, added_at, last_synced_at, last_contact_at, mdm_users(id, user_name, email), group_devices(groups(id, name, kind))";
 
 export function deviceRoutes() {
   const r = new Hono<AppEnv>();
@@ -20,7 +21,15 @@ export function deviceRoutes() {
 
   r.get("/actions", (c) =>
     c.json({
-      data: Object.entries(DEVICE_ACTIONS).map(([id, d]) => ({ id, label: d.label, minRole: d.minRole, confirm: d.confirm, params: d.params })),
+      data: Object.entries(DEVICE_ACTIONS).map(([id, d]) => ({
+        id,
+        label: d.label,
+        minRole: d.minRole,
+        confirm: d.confirm,
+        params: d.params,
+        platforms: d.platforms,
+        knoxOnlyAndroid: d.knoxOnlyAndroid ?? false,
+      })),
     }));
 
   r.get("/", async (c) => {
@@ -45,7 +54,16 @@ export function deviceRoutes() {
       db().from("events").select("id, action, state, error_code, error_message, action_time, completed_at, admins(email)")
         .eq("enterprise_id", s.enterpriseId).eq("device_id", id).order("action_time", { ascending: false }).limit(50),
     );
-    return c.json({ data: { ...maskDevice(device, s.role), events } });
+    const { tag, source } = deviceTag(device as Parameters<typeof deviceTag>[0]);
+    return c.json({
+      data: {
+        ...maskDevice(device, s.role),
+        events,
+        kiosk: await deviceHasKiosk(id),
+        // shown in the destructive-action dialog; owners/admins only (viewers can't run them)
+        confirm_tag: s.role === "viewer" ? null : { tag, source },
+      },
+    });
   });
 
   // Live Zoho command history for the device ("fetch logs & history").
@@ -95,6 +113,12 @@ export function deviceRoutes() {
   // Design rule: no profile -> device association.
   r.post("/:id/profiles", () => fail("DIRECT_PROFILE_DEVICE_BLOCKED", "Add the device to a group that has the profile instead"));
 
+  // Live list of apps currently installed on this device (fetched from Zoho).
+  r.get("/:id/apps", async (c) => {
+    const data = await deviceInstalledApps(c.get("session"), uuidParam(c.req.param("id")));
+    return c.json({ data });
+  });
+
   return r;
 }
 
@@ -110,9 +134,15 @@ export function commandRoutes() {
       params: obj(b, "params"),
       idempotencyKey: idempotencyKey(c),
     });
-    const needsConfirm = events.some((e) => e.state === "awaiting_confirmation");
-    return eventResponse(c, events, needsConfirm
-      ? { confirmation: { required: true, message: "Enter the device name and the code we emailed you to confirm." } }
+    const pending = events.find((e) => e.state === "awaiting_confirmation");
+    return eventResponse(c, events, pending
+      ? {
+        confirmation: {
+          required: true,
+          sent_to: c.get("session").email,
+          target: await confirmationTarget(c.get("session").enterpriseId, pending),
+        },
+      }
       : {});
   });
 
@@ -120,7 +150,8 @@ export function commandRoutes() {
     const b = await readJson(c.req.raw);
     const ev = await confirmCommand(c.get("session"), uuidParam(c.req.param("id")), {
       code: str(b, "code", { min: 6, max: 6 }),
-      deviceName: str(b, "deviceName", { max: 200 }),
+      // last 4 of the serial (or the group name for a group passcode reset); deviceName kept for old clients
+      typed: str(b, b.typed !== undefined ? "typed" : "deviceName", { max: 200 }),
     });
     return eventResponse(c, ev);
   });

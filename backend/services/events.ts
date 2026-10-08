@@ -241,8 +241,12 @@ export async function retryEvent(enterpriseId: string, id: string): Promise<Even
 
 export async function cancelEvent(enterpriseId: string, id: string): Promise<EventRow> {
   const ev = await run<EventRow>(db().from("events").select("*").eq("id", id).eq("enterprise_id", enterpriseId).single());
-  if (!["awaiting_confirmation", "requested", "dead"].includes(ev.state)) {
+  if (!["awaiting_confirmation", "requested", "dead", "failed"].includes(ev.state)) {
     fail("CONFLICT", "This event can no longer be cancelled");
+  }
+  // A worker is sending it to Zoho right now: cancelling would hide a command that may already be out.
+  if (ev.state === "requested" && ev.locked_until && Date.parse(ev.locked_until) > Date.now()) {
+    fail("CONFLICT", "This is being sent to Zoho right now and can't be cancelled");
   }
   return await updateEvent(id, { state: "cancelled", completed_at: new Date().toISOString(), locked_until: null });
 }

@@ -53,7 +53,7 @@ export async function activityView(el, ctx, params) {
         toastEvent(await post(`/api/events/${e.id}/retry`, {}), "Retried");
         load();
       } }] : []),
-      ...(admin && ["awaiting_confirmation", "requested", "dead"].includes(e.state) ? [{ label: "Cancel event", onClick: async () => {
+      ...(admin && ["awaiting_confirmation", "requested", "dead", "failed"].includes(e.state) ? [{ label: ["failed", "dead"].includes(e.state) ? "Dismiss" : "Cancel event", onClick: async () => {
         await post(`/api/events/${e.id}/cancel`, {});
         load();
       } }] : []),

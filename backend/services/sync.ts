@@ -1,7 +1,9 @@
 // Pull Zoho state into Supabase. Zoho is the source of truth for device state;
 // our tables add business data (department/function kind, events, announcements).
 import { db, run } from "../lib/db.ts";
-import { toAppError } from "../lib/errors.ts";
+import { getConfig } from "../config.ts";
+import { fail, toAppError } from "../lib/errors.ts";
+import { acquireLease, releaseLease } from "../lib/lease.ts";
 import { log } from "../lib/log.ts";
 import * as zoho from "../zoho/api.ts";
 import { recordAudit } from "./events.ts";
@@ -93,8 +95,28 @@ async function syncDevices(eid: string): Promise<number> {
     for (const u of created) userByZoho.set(String(u.zoho_user_id), u.id);
   }
 
+  const cfg = getConfig();
+  const now = Date.now();
+  const zombieMs = cfg.deviceZombieDays * 86400_000;
+
+  // Zoho returns last_contact_time as a ms-epoch STRING ("1791364641029") on
+  // both the list and detail endpoints; coerce to ISO. "-1" or missing → null.
+  // unregistered_time: Zoho's explicit "device was unenrolled" marker. "-1" means
+  // still enrolled; any positive timestamp means unenrolled at that moment.
+  const toContactIso = (v: unknown): string | null => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? new Date(n).toISOString() : null;
+  };
+  const isUnregistered = (v: unknown): boolean => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0;
+  };
+
   const rows = devices.filter((d) => d.device_id).map((d) => {
     const user = d.user as Json | undefined;
+    const contactMs = Number(d.last_contact_time);
+    const stale = Number.isFinite(contactMs) && contactMs > 0 && (now - contactMs) > zombieMs;
+    const unregistered = isUnregistered(d.unregistered_time);
     return {
       enterprise_id: eid,
       zoho_device_id: d.device_id,
@@ -108,7 +130,15 @@ async function syncDevices(eid: string): Promise<number> {
       imei: d.imei ? String(d.imei) : null,
       owned_by: (d.owned_by ?? null) as number | null,
       is_lost_mode: zbool(d.is_lost_mode_enabled),
-      is_removed: zbool(d.is_removed),
+      // Zoho list carries is_supervised; is_profileowner only on /devices/{id} detail
+      // (populated opportunistically by the device_details sync).
+      is_supervised: d.is_supervised === undefined ? null : zbool(d.is_supervised),
+      is_profileowner: d.is_profileowner === undefined ? null : zbool(d.is_profileowner),
+      // Samsung Knox devices get shutdown/restart via /knox_actions/. Positive knox_version → Knox-capable.
+      is_knox: Number((d.knox_details as { knox_version?: unknown } | undefined)?.knox_version ?? 0) > 0,
+      // Zoho-explicit unenrollment OR silence beyond ZOMBIE_DAYS auto-marks removed.
+      is_removed: zbool(d.is_removed) || unregistered || stale,
+      last_contact_at: toContactIso(d.last_contact_time),
       last_synced_at: nowIso(),
     };
   });
@@ -123,9 +153,15 @@ async function syncDevices(eid: string): Promise<number> {
     db().from("devices").select("id, zoho_device_id, device_name").eq("enterprise_id", eid).eq("is_removed", false),
   );
   const toRemove = localActive.filter((d) => !seen.has(String(d.zoho_device_id)));
+  // Union with zombies we just marked removed above (not in `localActive` after upsert).
+  const zombiesJustMarked = rows.filter((r) => r.is_removed).map((r) => String(r.zoho_device_id));
+  const zombieLocalIds = localActive.filter((d) => zombiesJustMarked.includes(String(d.zoho_device_id)));
+  const retireNow = [...toRemove, ...zombieLocalIds];
   if (toRemove.length) {
     await run(db().from("devices").update({ is_removed: true }).in("id", toRemove.map((d) => d.id)));
-    await onDevicesUnenrolled(eid, toRemove.map((d) => ({ id: d.id, device_name: d.device_name })));
+  }
+  if (retireNow.length) {
+    await onDevicesUnenrolled(eid, retireNow.map((d) => ({ id: d.id, device_name: d.device_name })));
   }
   return rows.length;
 }
@@ -175,28 +211,78 @@ async function syncGroups(eid: string): Promise<number> {
   return saved.length;
 }
 
+async function fetchPayloadConfig(eid: string, zpid: string, payloadNames: string[]): Promise<Record<string, Json>> {
+  const out: Record<string, Json> = {};
+  for (const name of payloadNames) {
+    try {
+      const summary = await zoho.getPayloadSummary(eid, zpid, name);
+      const itemIds = (summary.payloaditems ?? []).map(String);
+      if (!itemIds.length) continue;
+      // Usually one item per payload; if multiple, merge in order (later wins).
+      const items = await Promise.all(itemIds.map((id) => zoho.getPayloadItem(eid, zpid, name, id)));
+      out[name] = items.length === 1 ? items[0] : Object.assign({}, ...items);
+    } catch (e) {
+      log("warn", "sync.payload_item_failed", { enterprise_id: eid, zoho_profile_id: zpid, payload_name: name, error: String(e) });
+    }
+  }
+  return out;
+}
+
 async function syncProfiles(eid: string): Promise<number> {
   const profiles = await zoho.listProfiles(eid);
-  const local = await run<{ zoho_profile_id: number; state: string }[]>(
-    db().from("profiles").select("zoho_profile_id, state").eq("enterprise_id", eid).not("zoho_profile_id", "is", null),
+  const local = await run<{ zoho_profile_id: number; state: string; payload_names: string[] | null; payload_config: Record<string, Json> | null }[]>(
+    db().from("profiles").select("zoho_profile_id, state, payload_names, payload_config").eq("enterprise_id", eid).not("zoho_profile_id", "is", null),
   );
   const localState = new Map(local.map((p) => [String(p.zoho_profile_id), p.state]));
+  const localPayloads = new Map(local.map((p) => [String(p.zoho_profile_id), p.payload_names ?? []]));
+  const localConfig = new Map(local.map((p) => [String(p.zoho_profile_id), p.payload_config ?? {}]));
+
+  // Zoho's /profiles list omits payload info. For each non-trashed profile fetch
+  // detail (payload names) and then every payload item's actual field values, so
+  // payload_names + payload_config mirror Zoho — even for profiles created in the
+  // Zoho console. Keep local values on error so a transient failure doesn't wipe.
+  const detailById = new Map<string, string[]>();
+  const configById = new Map<string, Record<string, Json>>();
+  const needDetail = profiles.filter((p) => p.profile_id && !zbool(p.is_moved_to_trash));
+  await inBatches(needDetail, 4, async (p) => {
+    const zpid = String(p.profile_id);
+    try {
+      const detail = await zoho.getProfile(eid, p.profile_id as string | number);
+      const names = Array.isArray((detail as Json).payloads)
+        ? ((detail as Json).payloads as unknown[]).map(String)
+        : [];
+      detailById.set(zpid, names);
+      if (names.length) configById.set(zpid, await fetchPayloadConfig(eid, zpid, names));
+    } catch (e) {
+      log("warn", "sync.profile_detail_failed", { enterprise_id: eid, zoho_profile_id: zpid, error: String(e) });
+    }
+  });
+
   const rows = profiles.filter((p) => p.profile_id).map((p) => {
     // zbool: Zoho sends is_moved_to_trash as the STRING "false", which is truthy
     // in JS — bare `p.is_moved_to_trash ?` marked every profile as deleted.
     const remote = zbool(p.is_moved_to_trash)
       ? "deleted"
       : (/yet to deploy|draft/i.test(String(p.profile_status ?? "")) ? "draft" : "published");
-    // Keep "modified" (edited here, not yet re-published) unless Zoho says it was trashed.
-    const keep = localState.get(String(p.profile_id)) === "modified" && remote !== "deleted";
+    // Preserve local overrides:
+    //   "modified"  = edited here but not re-published → keep unless Zoho trashed it
+    //   "deleted"   = user clicked Delete here but Zoho refused the permanent delete
+    //                 (no public trash endpoint). Keep hidden locally; sync won't
+    //                 flip it back to Published just because Zoho still has it.
+    const local = localState.get(String(p.profile_id));
+    const keep = (local === "modified" || local === "deleted") && remote !== "deleted";
+    const zid = String(p.profile_id);
+    const payload_names = detailById.get(zid) ?? localPayloads.get(zid) ?? [];
+    const payload_config = configById.get(zid) ?? localConfig.get(zid) ?? {};
     return {
       enterprise_id: eid,
       zoho_profile_id: p.profile_id,
       name: String(p.profile_name ?? "Profile"),
       description: (p.profile_description ?? null) as string | null,
       platform: Number(p.platform_type) === 1 ? "ios" : "android",
-      state: keep ? "modified" : remote,
-      payload_names: Array.isArray(p.payloads) ? p.payloads.map(String) : [],
+      state: keep ? local! : remote,
+      payload_names,
+      payload_config,
       last_synced_at: nowIso(),
     };
   });
@@ -425,10 +511,51 @@ const SYNCERS: Record<Resource, (eid: string) => Promise<number>> = {
 
 /** Run the requested resources in dependency order; record one sync_runs row per resource.
  *  Default resources omit `device_details` (opt-in because it fans out per device). */
-export async function syncEnterprise(eid: string, resources: Resource[] = ALL, adminId: string | null = null) {
+const SYNC_LEASE_SECONDS = 20 * 60;
+/** Compliance often returns Zoho 500 for accounts without the feature: after a failure, the
+ *  scheduled sync leaves it alone for a while (a manual sync still tries). */
+const COMPLIANCE_BACKOFF_MS = 6 * 3600_000;
+const complianceFailedAt = new Map<string, number>();
+
+/**
+ * One sync per enterprise at a time, across every process (lease "sync:<eid>").
+ * opts.quietIfBusy (scheduled runs) skips quietly when another sync holds the lease;
+ * a manual sync gets SYNC_IN_PROGRESS instead.
+ */
+export async function syncEnterprise(
+  eid: string,
+  resources: Resource[] = ALL,
+  adminId: string | null = null,
+  opts: { quietIfBusy?: boolean } = {},
+) {
+  const lease = `sync:${eid}`;
+  if (!(await acquireLease(lease, SYNC_LEASE_SECONDS))) {
+    if (opts.quietIfBusy) {
+      log("info", "sync.skipped_busy", { enterprise_id: eid });
+      return { skipped: "another sync is running" } as Record<string, number | string>;
+    }
+    fail("SYNC_IN_PROGRESS");
+  }
+  try {
+    // We hold the lease, so any "running" row for this enterprise belongs to a sync that died.
+    await db().from("sync_runs")
+      .update({ status: "failed", error: "Interrupted: the server stopped or restarted during this sync", finished_at: nowIso() })
+      .eq("enterprise_id", eid).eq("status", "running");
+    return await syncEnterpriseLocked(eid, resources, adminId, () => acquireLease(lease, SYNC_LEASE_SECONDS, true));
+  } finally {
+    await releaseLease(lease);
+  }
+}
+
+async function syncEnterpriseLocked(eid: string, resources: Resource[], adminId: string | null, renew: () => Promise<boolean>) {
   const ordered = [...ALL, ...OPTIONAL].filter((r) => resources.includes(r));
   const result: Record<string, number | string> = {};
   for (const resource of ordered) {
+    await renew();
+    if (resource === "compliance" && !adminId && Date.now() - (complianceFailedAt.get(eid) ?? 0) < COMPLIANCE_BACKOFF_MS) {
+      result[resource] = "skipped: failed recently";
+      continue;
+    }
     // sync_runs is bookkeeping — if its CHECK constraint rejects a new resource key
     // (migration not yet applied), log and still run the syncer so data flows.
     let runId: string | null = null;
@@ -443,12 +570,14 @@ export async function syncEnterprise(eid: string, resources: Resource[] = ALL, a
     try {
       const items = await SYNCERS[resource](eid);
       result[resource] = items;
+      if (resource === "compliance") complianceFailedAt.delete(eid);
       if (runId) {
         await db().from("sync_runs").update({ status: "succeeded", items, finished_at: nowIso() }).eq("id", runId);
       }
     } catch (e) {
       const err = toAppError(e);
       result[resource] = `error: ${err.code}`;
+      if (resource === "compliance") complianceFailedAt.set(eid, Date.now());
       if (runId) {
         await db().from("sync_runs").update({ status: "failed", error: `${err.code}: ${err.message}`.slice(0, 500), finished_at: nowIso() })
           .eq("id", runId);

@@ -168,6 +168,68 @@ export function emptyState(title, text, action) {
   return h("div", { class: "empty" }, h("h3", {}, title), h("p", {}, text), action ?? null);
 }
 
+/**
+ * Filterable list — text search box + optional platform filter chips. Delegates
+ * rendering to the caller via a render(item) callback so it works for pickers,
+ * read-only lists, or lists with inline action buttons alike.
+ *
+ * Options:
+ *   search(item): string used by the text filter (defaults to JSON of item)
+ *   platformKey: field name on each item whose value is the platform string
+ *   platforms: ordered list of {value, label} chips (empty = no platform filter)
+ *   render(item): the DOM node for one row
+ *   empty: text or node shown when the filtered list is empty
+ *   onCountChange(n, total): optional callback whenever the visible count changes
+ */
+export function filterableList(items, {
+  search = (x) => JSON.stringify(x).toLowerCase(),
+  platformKey = null,
+  platforms = [],
+  render,
+  empty = "Nothing to show",
+  onCountChange = null,
+} = {}) {
+  const searchInput = h("input", { type: "search", placeholder: "Search…", "aria-label": "Search", class: "filter-search" });
+  let platformFilter = "";
+  const rowsBox = h("div", { class: "filter-rows" });
+  const counter = h("span", { class: "muted small" }, "");
+
+  const draw = () => {
+    const q = searchInput.value.trim().toLowerCase();
+    const visible = items.filter((it) =>
+      (!q || search(it).toLowerCase().includes(q)) &&
+      (!platformFilter || String(it[platformKey] ?? "") === platformFilter)
+    );
+    clear(rowsBox, visible.length ? visible.map(render) : h("p", { class: "muted" }, empty));
+    counter.textContent = `${visible.length} of ${items.length}`;
+    if (onCountChange) onCountChange(visible.length, items.length);
+  };
+
+  const chips = platforms.length
+    ? h("div", { class: "filter-chips" },
+      [{ value: "", label: "All" }, ...platforms].map((p) =>
+        h("button", {
+          type: "button",
+          class: `chip`,
+          "data-active": p.value === platformFilter ? "true" : "false",
+          onclick: (e) => {
+            platformFilter = p.value;
+            for (const c of chips.querySelectorAll("[data-active]")) c.setAttribute("data-active", "false");
+            e.currentTarget.setAttribute("data-active", "true");
+            draw();
+          },
+        }, p.label)))
+    : null;
+
+  searchInput.addEventListener("input", draw);
+  draw();
+  return h("div", { class: "filterable-list" },
+    h("div", { class: "filter-head" }, searchInput, counter),
+    chips,
+    rowsBox,
+  );
+}
+
 export function loading() {
   return h("div", { class: "loading", "aria-busy": "true" }, "Loading…");
 }

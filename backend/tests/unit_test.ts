@@ -11,13 +11,36 @@ const { decryptSecret, encryptSecret, hmacHex, randomDigits } = await import("..
 const { toSafeHtml } = await import("../services/announcements.ts");
 const { backoffMs } = await import("../services/events.ts");
 const { apiBaseFor, normaliseAccountsServer } = await import("../zoho/client.ts");
-const { DEVICE_ACTIONS } = await import("../services/commands.ts");
+const { DEVICE_ACTIONS, DESTRUCTIVE, deviceTag } = await import("../services/commands.ts");
+const { redactParams } = await import("../routes/helpers.ts");
 
 Deno.test("restrictions map allow/restrict to the guide's numeric values", () => {
   const p = buildRestrictionsPayload({ allow_factory_reset: "restrict", allow_camera: "restrict", allow_usb_debug: "allow" });
   assert.deepEqual(p, { allow_factory_reset: 0, allow_camera: 2, allow_usb_debug: 1 });
   assert.throws(() => buildRestrictionsPayload({ allow_teleport: "restrict" }));
   assert.throws(() => buildRestrictionsPayload({}));
+});
+
+Deno.test("restrictions support enum, integer, and boolean kinds", () => {
+  const p = buildRestrictionsPayload({
+    allow_wifi: 4,                       // enum: locked on
+    allow_storage_encryption: 2,         // enum: required
+    screen_timeout: 30,                  // integer in [15, 1800]
+    adaptive_brightness: false,          // boolean
+  });
+  assert.deepEqual(p, {
+    allow_wifi: 4,
+    allow_storage_encryption: 2,
+    screen_timeout: 30,
+    adaptive_brightness: false,
+  });
+});
+
+Deno.test("restrictions reject out-of-range and bad enum/boolean values", () => {
+  assert.throws(() => buildRestrictionsPayload({ screen_timeout: 5000 }));       // > max
+  assert.throws(() => buildRestrictionsPayload({ allow_wifi: 7 }));              // not an enum option
+  assert.throws(() => buildRestrictionsPayload({ adaptive_brightness: "yes" })); // not boolean
+  assert.throws(() => buildRestrictionsPayload({ brightness_value: -1 }));       // < min
 });
 
 Deno.test("kiosk payload encodes allowed_apps as a JSON string", () => {
@@ -28,10 +51,67 @@ Deno.test("kiosk payload encodes allowed_apps as a JSON string", () => {
   assert.throws(() => buildKioskPayload({ mode: "single", apps: [{ appId: "1", packageName: "bad name!" }] }));
 });
 
+Deno.test("kiosk payload fills every Zoho field with sensible defaults", () => {
+  const p = buildKioskPayload({ mode: "single", apps: [{ appId: "1", packageName: "com.a.b" }] });
+  // Launcher / display defaults
+  assert.equal(p.launcher_type, 2);
+  assert.equal(p.screen_orientation, 2);
+  assert.equal(p.screen_timeout, 0);
+  // Shutdown mirrors power button when not set
+  assert.equal(p.allow_shutdown, p.allow_power_button);
+  // All the new buttons / chrome fields are present
+  for (const k of ["allow_volume_button", "allow_key_guard", "allow_notification", "allow_recent_apps", "allow_task_manager", "allow_system_error_dialog", "allow_custom_settings", "show_me_mdm_app", "allow_status_bar_expansion"]) {
+    assert.ok(k in p, `missing ${k}`);
+  }
+});
+
+Deno.test("kiosk payload rejects invalid launcher / orientation / timeout", () => {
+  const apps = [{ appId: "1", packageName: "com.a.b" }];
+  assert.throws(() => buildKioskPayload({ mode: "single", apps, launcherType: 9 as 1 | 2 }));
+  assert.throws(() => buildKioskPayload({ mode: "single", apps, screenOrientation: 99 as 1 }));
+  assert.throws(() => buildKioskPayload({ mode: "single", apps, screenTimeout: 7 }));
+});
+
 Deno.test("passcode payload validates the wipe threshold", () => {
   assert.equal(buildPasscodePayload({ maxFailedAttempts: 8 }).max_failed_attempts, 8);
   assert.equal(buildPasscodePayload({ maxFailedAttempts: -1 }).max_failed_attempts, -1);
   assert.throws(() => buildPasscodePayload({ maxFailedAttempts: 2 }));
+});
+
+Deno.test("passcode payload fills Zoho's required + sensible defaults", () => {
+  const p = buildPasscodePayload({});
+  // scope_for_passcode is required by Zoho; default to device scope.
+  assert.equal(p.scope_for_passcode, 0);
+  // Enforcement knobs Zoho honours by default.
+  assert.equal(p.grace_period, 60);
+  assert.equal(p.allow_fingerprint, 1);
+  assert.equal(p.allow_face_unlock, true);
+  assert.equal(p.allow_iris_scan, true);
+  assert.equal(p.allow_one_lock, true);
+});
+
+Deno.test("passcode payload forwards all opt-in fields", () => {
+  const p = buildPasscodePayload({
+    scope: 1,
+    gracePeriodMinutes: 15,
+    allowFingerprint: 0,
+    allowFaceUnlock: false,
+    allowIrisScan: false,
+    allowOneLock: false,
+  });
+  assert.equal(p.scope_for_passcode, 1);
+  assert.equal(p.grace_period, 15);
+  assert.equal(p.allow_fingerprint, 0);
+  assert.equal(p.allow_face_unlock, false);
+  assert.equal(p.allow_iris_scan, false);
+  assert.equal(p.allow_one_lock, false);
+});
+
+Deno.test("passcode payload rejects out-of-range grace period and bad scope", () => {
+  assert.throws(() => buildPasscodePayload({ gracePeriodMinutes: 2000 }));
+  assert.throws(() => buildPasscodePayload({ gracePeriodMinutes: 0 }));
+  assert.throws(() => buildPasscodePayload({ scope: 99 }));
+  assert.throws(() => buildPasscodePayload({ allowFingerprint: 2 }));
 });
 
 Deno.test("secrets round-trip through AES-GCM and never appear in ciphertext", async () => {
@@ -67,6 +147,21 @@ Deno.test("destructive actions need confirmation and the owner role", () => {
   assert.equal(DEVICE_ACTIONS.complete_wipe.confirm, true);
   assert.equal(DEVICE_ACTIONS.complete_wipe.minRole, "owner");
   assert.equal(DEVICE_ACTIONS.lock.confirm, false);
+  // Every wipe and passcode action must go through the emailed-code step.
+  assert.deepEqual([...DESTRUCTIVE].sort(), ["clear_passcode", "complete_wipe", "corporate_wipe", "reset_passcode"]);
+});
+
+Deno.test("devices with the same name are told apart by serial / IMEI tail", () => {
+  assert.deepEqual(deviceTag({ serial_number: "r58x-1a2b", imei: "357327071694307", zoho_device_id: "247008000000130084" }), { tag: "1A2B", source: "serial number" });
+  assert.deepEqual(deviceTag({ serial_number: null, imei: "357327071694307", zoho_device_id: "1" }), { tag: "4307", source: "IMEI" });
+  assert.deepEqual(deviceTag({ serial_number: "", imei: null, zoho_device_id: "247008000000130084" }), { tag: "0084", source: "device id" });
+});
+
+Deno.test("passcodes never leave the server; viewers don't see contact details", () => {
+  const p = { passcode_enc: "abc", email_sent_to_user: true, phone_number: "+255700000000" };
+  assert.deepEqual(redactParams(p, "admin"), { passcode: "[hidden]", email_sent_to_user: true, phone_number: "+255700000000" });
+  assert.deepEqual(redactParams(p, "viewer"), { passcode: "[hidden]", email_sent_to_user: true, phone_number: "[hidden]" });
+  assert.deepEqual(redactParams({ passcode: "1234" }), { passcode: "[hidden]" });
 });
 
 // ------------------------------------------------------------ monitoring

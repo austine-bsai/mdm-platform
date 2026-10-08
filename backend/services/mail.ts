@@ -56,13 +56,30 @@ export function otpMail(to: string, code: string, minutes: number): Mail {
   };
 }
 
-export function confirmMail(to: string, code: string, action: string, deviceName: string, minutes: number): Mail {
+/**
+ * Second step of a destructive action, sent to the requesting admin's sign-in email.
+ * `target` describes exactly what will be affected; `typeThis` is what they must type
+ * in the console besides the code (a serial-number tail or the group name).
+ */
+export function confirmMail(
+  to: string,
+  code: string,
+  c: { action: string; targetTitle: string; target: string[]; typeThis: string; typeWhat: string; minutes: number },
+): Mail {
   return {
     to,
-    subject: `Confirm ${action} on ${deviceName}`,
-    text:
-      `Someone signed in as you requested "${action}" on device "${deviceName}".\n` +
-      `Confirmation code: ${code}\nIt expires in ${minutes} minutes.\n` +
-      `If this was not you, do nothing — the request will be cancelled automatically.`,
+    subject: `Confirm ${c.action} on ${c.targetTitle}`,
+    text: [
+      `You asked to run: ${c.action}`,
+      "",
+      ...c.target,
+      "",
+      `Confirmation code: ${code}`,
+      `In the console, enter this code and type ${c.typeWhat}: ${c.typeThis}`,
+      `The code expires in ${c.minutes} minutes and works only for you.`,
+      "",
+      "If you did not ask for this, ignore this email. Nothing happens and the request is cancelled when the code expires.",
+      "Then change your password: someone may be signed in as you.",
+    ].join("\n"),
   };
 }

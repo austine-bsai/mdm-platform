@@ -12,8 +12,13 @@ export const getDeviceSummary = (eid: string, deviceId: Id) =>
   zohoRequest<Json>(eid, { path: `/devices/${deviceId}/summary` });
 export const getDeviceActions = (eid: string, deviceId: Id) =>
   zohoRequest<Json>(eid, { path: `/devices/${deviceId}/actions` });
+// The dev guide (p. 65) marks action_name as a required BODY field, but the live API rejects it
+// with "Invalid parameter action_name detected" — the URL segment is authoritative. Guide is wrong.
 export const runDeviceAction = (eid: string, deviceId: Id, action: string, body: Json = {}) =>
   zohoRequest<Json>(eid, { method: "POST", path: `/devices/${deviceId}/actions/${action}`, body });
+// Samsung-only path for actions standard Android MDM can't do (shutdown, restart).
+export const runKnoxDeviceAction = (eid: string, deviceId: Id, action: string, body: Json = {}) =>
+  zohoRequest<Json>(eid, { method: "POST", path: `/devices/${deviceId}/knox_actions/${action}`, body });
 export const runBulkAction = (eid: string, command: string, body: Json) =>
   zohoRequest<Json>(eid, { method: "POST", path: `/actions/${command}`, body });
 export const getCommandHistory = (eid: string, deviceId: Id, query: { days?: number; limit?: number } = {}) =>
@@ -98,6 +103,14 @@ export const deleteProfiles = (eid: string, profileIds: Id[]) =>
   zohoRequest<Json>(eid, { method: "DELETE", path: "/profiles", body: { profile_ids: profileIds } });
 export const listPayloads = (eid: string, profileId: Id) =>
   zohoRequest<Json>(eid, { path: `/profiles/${profileId}/payloads` });
+/** Items (and their ids) under one named payload on a profile. */
+export const getPayloadSummary = (eid: string, profileId: Id, payloadName: string) =>
+  zohoRequest<{ payloaditems?: Id[]; payload_name?: string; payload_type?: string }>(eid, {
+    path: `/profiles/${profileId}/payloads/${payloadName}`,
+  });
+/** The actual field values stored in one payload item. */
+export const getPayloadItem = (eid: string, profileId: Id, payloadName: string, itemId: Id) =>
+  zohoRequest<Json>(eid, { path: `/profiles/${profileId}/payloads/${payloadName}/payloaditems/${itemId}` });
 export const addPayload = (eid: string, profileId: Id, payloadName: string, body: Json) =>
   zohoRequest<Json>(eid, { method: "POST", path: `/profiles/${profileId}/payloads/${payloadName}`, body });
 export const removePayload = (eid: string, profileId: Id, payloadName: string) =>
@@ -109,6 +122,44 @@ export const pushProfileUpdate = (eid: string, profileId: Id) =>
 
 // --------------------------------------------------------------------- apps
 export const listApps = (eid: string) => zohoPaginate<Json>(eid, "/apps", "apps");
+/** Detail for one app, including release_labels for version-pinned installs. */
+export const getAppDetail = (eid: string, appId: Id) =>
+  zohoRequest<Json>(eid, { path: `/apps/${appId}` });
+/** Push apps to every device in the group. Each entry needs app_id + release_label_id. */
+export const installAppsOnGroup = (
+  eid: string,
+  groupId: Id,
+  appDetails: { app_id: Id; release_label_id: Id }[],
+  opts: { silent_install?: boolean; notify_user_via_email?: boolean } = {},
+) =>
+  zohoRequest<Json>(eid, {
+    method: "POST",
+    path: `/groups/${groupId}/apps`,
+    body: { app_details: appDetails, silent_install: opts.silent_install ?? true, notify_user_via_email: opts.notify_user_via_email ?? false },
+  });
+export const uninstallAppsFromGroup = (eid: string, groupId: Id, appIds: Id[]) =>
+  zohoRequest<Json>(eid, { method: "DELETE", path: `/groups/${groupId}/apps`, body: { app_ids: appIds } });
+/** Live list of apps currently on a device. Returns { installed_apps: [...] }. */
+export const listDeviceApps = (eid: string, deviceId: Id) =>
+  zohoRequest<Json>(eid, { path: `/devices/${deviceId}/apps`, query: { include: "details" } });
+
+// --------------------------------------------------------- app blacklist
+// Zoho's blocklist is a two-step model: (1) register the app in /blacklist/apps
+// (returns an appgroupid), (2) apply that appgroupid to resources (devices or
+// groups) via /blacklist/devices. The removal mirrors step 2.
+type BlacklistAppInput = { identifier: string; platform: number; appname: string };
+
+export const listBlacklistApps = (eid: string) =>
+  zohoRequest<Json>(eid, { path: "/blacklist/apps" });
+export const addBlacklistApp = (eid: string, apps: BlacklistAppInput[]) =>
+  zohoRequest<Json>(eid, { method: "POST", path: "/blacklist/apps", body: { apps } });
+export const deleteBlacklistApp = (eid: string, appGroupIds: Id[]) =>
+  zohoRequest<Json>(eid, { method: "DELETE", path: "/blacklist/apps", body: { app_group_ids: appGroupIds } });
+/** Apply existing blacklist appgroupids to resources (devices or groups). */
+export const applyBlacklistToResources = (eid: string, resourceIds: Id[], appGroupIds: Id[]) =>
+  zohoRequest<Json>(eid, { method: "POST", path: "/blacklist/devices", body: { resource_ids: resourceIds, app_group_ids: appGroupIds } });
+export const removeBlacklistFromResources = (eid: string, resourceIds: Id[], appGroupIds: Id[]) =>
+  zohoRequest<Json>(eid, { method: "DELETE", path: "/blacklist/devices", body: { resource_ids: resourceIds, app_group_ids: appGroupIds } });
 
 // -------------------------------------------------------------------- users
 export const listUsers = (eid: string) => zohoPaginate<Json>(eid, "/users", "users");

@@ -20,67 +20,214 @@ export const PAYLOAD = {
   },
 } as const;
 
-export type Purpose = "restrictions" | "kiosk" | "passcode" | "frp" | "wifi" | "custom";
+export type Purpose = "restrictions" | "kiosk" | "passcode" | "frp" | "wifi" | "custom" | "apps" | "app_blacklist";
 
-type RestrictionDef = {
-  key: string;
-  label: string;
-  category: "security" | "data" | "hardware" | "apps" | "settings";
-  allow: number;
-  restrict: number;
-  recommended: "allow" | "restrict"; // suggested for corporate fully-managed devices
-};
+// 'apps' and 'app_blacklist' are platform-synthetic profiles — they live only
+// in our DB (no Zoho profile_id). Their payload_config holds the app list; the
+// group.associate_profiles executor translates them into install / blacklist
+// API calls when they're attached to a group. These names are our own and
+// never go over the wire to Zoho.
+export const APP_PROFILE_PAYLOAD = "platform_apps_install";
+export const APP_BLACKLIST_PAYLOAD = "platform_apps_blacklist";
+
+export type AppProfileEntry = { appId: string; releaseLabelId?: string | null; appName?: string };
+export function buildAppsPayload(apps: AppProfileEntry[]) {
+  if (!apps.length) fail("VALIDATION_FAILED", "Pick at least one app");
+  return { apps: apps.map((a) => ({ appId: String(a.appId), releaseLabelId: a.releaseLabelId ?? null, appName: a.appName ?? null })) };
+}
+
+export type BlacklistProfileEntry = { identifier: string; platform: number; appname: string };
+export function buildAppBlacklistPayload(apps: BlacklistProfileEntry[]) {
+  if (!apps.length) fail("VALIDATION_FAILED", "Pick at least one app to blacklist");
+  for (const a of apps) {
+    if (!/^[a-zA-Z][\w.]+$/.test(a.identifier)) fail("VALIDATION_FAILED", `Invalid package identifier ${a.identifier}`);
+  }
+  return { apps };
+}
+
+export type RestrictionCategory =
+  | "security"
+  | "data"
+  | "hardware"
+  | "apps"
+  | "settings"
+  | "display"
+  | "network";
+
+/**
+ * Restriction catalog uses a discriminated union so each Zoho field can model
+ * its native shape: a simple allow/restrict toggle (binary), a multi-state
+ * (enum, e.g. radios that can be "allow toggle" or "locked on"), a numeric
+ * range (integer, e.g. brightness 0-255), or a flat on/off (boolean).
+ */
+export type RestrictionDef =
+  | {
+    kind: "binary";
+    key: string;
+    label: string;
+    category: RestrictionCategory;
+    allow: number;
+    restrict: number;
+    recommended: "allow" | "restrict";
+    hint?: string;
+  }
+  | {
+    kind: "enum";
+    key: string;
+    label: string;
+    category: RestrictionCategory;
+    options: readonly { value: number | string; label: string }[];
+    recommended?: number | string;
+    hint?: string;
+  }
+  | {
+    kind: "integer";
+    key: string;
+    label: string;
+    category: RestrictionCategory;
+    min: number;
+    max: number;
+    recommended?: number;
+    unit?: string;
+    hint?: string;
+  }
+  | {
+    kind: "boolean";
+    key: string;
+    label: string;
+    category: RestrictionCategory;
+    recommended?: boolean;
+    hint?: string;
+  };
 
 export const ANDROID_RESTRICTIONS: readonly RestrictionDef[] = [
-  { key: "allow_factory_reset", label: "Factory reset from Settings", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_safe_mode", label: "Boot into safe mode", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_developer_mode", label: "Developer options", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_usb_debug", label: "USB debugging", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_non_market_apps", label: "Install apps from unknown sources", category: "apps", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_install_app", label: "Users can install apps", category: "apps", allow: 1, restrict: 0, recommended: "allow" },
-  { key: "allow_uninstall_app", label: "Users can uninstall apps", category: "apps", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_android_market", label: "Play Store access", category: "apps", allow: 1, restrict: 0, recommended: "allow" },
-  { key: "allow_user_add_accounts", label: "Add or remove accounts", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_date_time_change", label: "Change date and time", category: "settings", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_settings", label: "Modify device settings", category: "settings", allow: 1, restrict: 0, recommended: "allow" },
-  { key: "allow_usb_media_player", label: "USB file transfer", category: "data", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_screen_capture", label: "Screenshots", category: "data", allow: 1, restrict: 0, recommended: "allow" },
-  { key: "allow_sd_card", label: "SD card", category: "data", allow: 1, restrict: 0, recommended: "allow" },
-  { key: "allow_usb_tethering", label: "USB tethering", category: "data", allow: 1, restrict: 0, recommended: "restrict" },
-  { key: "allow_camera", label: "Camera", category: "hardware", allow: 1, restrict: 2, recommended: "allow" },
-  { key: "allow_video_record", label: "Video recording", category: "hardware", allow: 1, restrict: 2, recommended: "allow" },
-  { key: "allow_audio_record", label: "Audio recording", category: "hardware", allow: 1, restrict: 2, recommended: "allow" },
-  { key: "allow_microphone", label: "Microphone", category: "hardware", allow: 1, restrict: 0, recommended: "allow" },
+  // ----------------------------------------------------------- security
+  { kind: "binary", key: "allow_factory_reset", label: "Factory reset from Settings", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
+  { kind: "binary", key: "allow_safe_mode", label: "Boot into safe mode", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
+  { kind: "binary", key: "allow_developer_mode", label: "Developer options", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
+  { kind: "binary", key: "allow_usb_debug", label: "USB debugging", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
+  { kind: "binary", key: "allow_user_add_accounts", label: "Add or remove accounts", category: "security", allow: 1, restrict: 0, recommended: "restrict" },
+  { kind: "binary", key: "allow_keyguard_notifications", label: "Lock-screen notification previews", category: "security", allow: 1, restrict: 0, recommended: "restrict", hint: "Restrict hides message bodies on the lock screen." },
+  { kind: "binary", key: "allow_play_protect_monitoring", label: "Google Play Protect scanning", category: "security", allow: 1, restrict: 0, recommended: "allow" },
+  { kind: "enum", key: "allow_storage_encryption", label: "Internal storage encryption", category: "security", options: [{ value: 0, label: "Not required" }, { value: 2, label: "Required" }], recommended: 2 },
+  { kind: "enum", key: "external_storage_encryption", label: "SD card encryption", category: "security", options: [{ value: 0, label: "Not required" }, { value: 2, label: "Required" }], recommended: 2 },
+
+  // ---------------------------------------------------------------- apps
+  { kind: "binary", key: "allow_non_market_apps", label: "Install apps from unknown sources", category: "apps", allow: 1, restrict: 0, recommended: "restrict" },
+  { kind: "binary", key: "allow_install_app", label: "Users can install apps", category: "apps", allow: 1, restrict: 0, recommended: "allow" },
+  { kind: "binary", key: "allow_uninstall_app", label: "Users can uninstall apps", category: "apps", allow: 1, restrict: 0, recommended: "restrict" },
+  { kind: "binary", key: "allow_android_market", label: "Play Store access", category: "apps", allow: 1, restrict: 0, recommended: "allow" },
+  { kind: "binary", key: "allow_all_apps_access", label: "Show every installed app in app drawer", category: "apps", allow: 1, restrict: 0, recommended: "allow", hint: "Restrict hides apps not explicitly allowed by policy." },
+
+  // ------------------------------------------------------------ settings
+  { kind: "binary", key: "allow_date_time_change", label: "Change date and time", category: "settings", allow: 1, restrict: 0, recommended: "restrict" },
+  { kind: "binary", key: "allow_settings", label: "Modify device settings", category: "settings", allow: 1, restrict: 0, recommended: "allow" },
+
+  // ---------------------------------------------------------------- data
+  { kind: "binary", key: "allow_usb_media_player", label: "USB file transfer", category: "data", allow: 1, restrict: 0, recommended: "restrict" },
+  { kind: "binary", key: "allow_screen_capture", label: "Screenshots", category: "data", allow: 1, restrict: 0, recommended: "allow" },
+  { kind: "binary", key: "allow_sd_card", label: "SD card", category: "data", allow: 1, restrict: 0, recommended: "allow" },
+  { kind: "binary", key: "allow_usb_tethering", label: "USB tethering", category: "data", allow: 1, restrict: 0, recommended: "restrict" },
+
+  // ------------------------------------------------------------ hardware
+  { kind: "binary", key: "allow_camera", label: "Camera", category: "hardware", allow: 1, restrict: 2, recommended: "allow" },
+  { kind: "binary", key: "allow_video_record", label: "Video recording", category: "hardware", allow: 1, restrict: 2, recommended: "allow" },
+  { kind: "binary", key: "allow_audio_record", label: "Audio recording", category: "hardware", allow: 1, restrict: 2, recommended: "allow" },
+  { kind: "binary", key: "allow_microphone", label: "Microphone", category: "hardware", allow: 1, restrict: 0, recommended: "allow" },
+
+  // ------------------------------------------------------------- network
+  // Radios use "4" (locked on) rather than full restrict so the device still works.
+  { kind: "enum", key: "allow_wifi", label: "Wi-Fi radio", category: "network", options: [{ value: 1, label: "User can toggle" }, { value: 4, label: "Locked on" }], recommended: 1 },
+  { kind: "enum", key: "allow_bluetooth", label: "Bluetooth radio", category: "network", options: [{ value: 1, label: "User can toggle" }, { value: 4, label: "Locked on" }], recommended: 1 },
+  { kind: "enum", key: "allow_nfc", label: "NFC radio", category: "network", options: [{ value: 1, label: "User can toggle" }, { value: 4, label: "Locked on" }], recommended: 1 },
+  { kind: "enum", key: "allow_disabling_gps", label: "GPS / location", category: "network", options: [{ value: 1, label: "User can disable" }, { value: 4, label: "User cannot disable" }], recommended: 4 },
+  { kind: "binary", key: "allow_whitelist_wifi_only", label: "Restrict to whitelisted Wi-Fi only", category: "network", allow: 1, restrict: 0, recommended: "allow" },
+  { kind: "boolean", key: "set_roaming_always_on", label: "Keep data roaming always on", category: "network", recommended: false },
+  { kind: "boolean", key: "allow_data_saver", label: "Data saver", category: "network", recommended: false },
+
+  // ------------------------------------------------------------- display
+  { kind: "integer", key: "screen_timeout", label: "Screen auto-lock", category: "display", min: 15, max: 1800, recommended: 60, unit: "seconds" },
+  { kind: "integer", key: "brightness_value", label: "Fixed brightness (0 = darkest, 255 = brightest)", category: "display", min: 0, max: 255 },
+  { kind: "boolean", key: "adaptive_brightness", label: "Adaptive brightness", category: "display", recommended: true },
 ];
 
-const RESTRICTION_KEYS = new Set(ANDROID_RESTRICTIONS.map((r) => r.key));
+const RESTRICTION_BY_KEY = new Map(ANDROID_RESTRICTIONS.map((r) => [r.key, r] as const));
 
-/** selection: { allow_factory_reset: "restrict", allow_camera: "allow", ... } */
-export function buildRestrictionsPayload(selection: Record<string, unknown>): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const def of ANDROID_RESTRICTIONS) {
-    const choice = selection[def.key];
-    if (choice === undefined) continue;
-    if (choice !== "allow" && choice !== "restrict") {
-      fail("VALIDATION_FAILED", `${def.key} must be "allow" or "restrict"`);
+/**
+ * Resolve a user choice into the raw Zoho value for one restriction.
+ * selection shape:
+ *   binary  -> "allow" | "restrict"
+ *   enum    -> the option.value
+ *   integer -> number in [min, max]
+ *   boolean -> true | false
+ */
+function resolveRestriction(def: RestrictionDef, choice: unknown): number | boolean {
+  switch (def.kind) {
+    case "binary":
+      if (choice !== "allow" && choice !== "restrict") {
+        fail("VALIDATION_FAILED", `${def.key} must be "allow" or "restrict"`);
+      }
+      return choice === "allow" ? def.allow : def.restrict;
+    case "enum": {
+      const match = def.options.find((o) => o.value === choice || String(o.value) === String(choice));
+      if (!match) fail("VALIDATION_FAILED", `${def.key} must be one of: ${def.options.map((o) => o.value).join(", ")}`);
+      return match.value as number;
     }
-    out[def.key] = choice === "allow" ? def.allow : def.restrict;
+    case "integer": {
+      const n = Number(choice);
+      if (!Number.isFinite(n) || n < def.min || n > def.max) {
+        fail("VALIDATION_FAILED", `${def.key} must be a number in [${def.min}, ${def.max}]`);
+      }
+      return n;
+    }
+    case "boolean":
+      if (typeof choice !== "boolean") fail("VALIDATION_FAILED", `${def.key} must be true or false`);
+      return choice;
   }
-  const unknown = Object.keys(selection).filter((k) => !RESTRICTION_KEYS.has(k));
-  if (unknown.length) fail("VALIDATION_FAILED", `Unknown restrictions: ${unknown.join(", ")}`);
+}
+
+export function buildRestrictionsPayload(selection: Record<string, unknown>): Record<string, number | boolean> {
+  const out: Record<string, number | boolean> = {};
+  for (const [key, raw] of Object.entries(selection)) {
+    if (raw === undefined || raw === null || raw === "") continue;
+    const def = RESTRICTION_BY_KEY.get(key);
+    if (!def) fail("VALIDATION_FAILED", `Unknown restriction: ${key}`);
+    out[key] = resolveRestriction(def, raw);
+  }
   if (!Object.keys(out).length) fail("VALIDATION_FAILED", "Choose at least one restriction");
   return out;
 }
 
 export type KioskApp = { appId: string; packageName: string; name?: string };
 
+// Allowed values for Zoho's enum-typed kiosk fields.
+const KIOSK_LAUNCHER_TYPES = [1, 2] as const; // 1 default device launcher, 2 MDM launcher
+const KIOSK_SCREEN_ORIENTATIONS = [1, 2, 3, 4] as const; // 1 auto, 2 user, 3 portrait, 4 landscape
+const KIOSK_SCREEN_TIMEOUTS = [0, 15, 30, 60, 300, 1800, 2147483647] as const; // 0 user, 2147483647 always on
+
 export function buildKioskPayload(input: {
   mode: "single" | "multi";
   apps: KioskApp[];
+  // Hardware buttons (all default true in Zoho → kiosk lockdown should restrict most)
   allowStatusBar?: boolean;
+  allowStatusBarExpansion?: boolean;
   allowHomeButton?: boolean;
   allowBackButton?: boolean;
   allowPowerButton?: boolean;
+  allowVolumeButton?: boolean;
+  allowShutdown?: boolean;
+  allowKeyGuard?: boolean;
+  // UI chrome
+  allowNotification?: boolean;
+  allowRecentApps?: boolean;
+  allowTaskManager?: boolean;
+  allowSystemErrorDialog?: boolean;
+  allowCustomSettings?: boolean;
+  showMeMdmApp?: boolean;
+  // Launcher / display
+  launcherType?: 1 | 2;
+  screenOrientation?: 1 | 2 | 3 | 4;
+  screenTimeout?: number;
   extra?: Record<string, unknown>; // any other kiosk field from the guide, passed through as-is
 }) {
   if (!input.apps.length) fail("VALIDATION_FAILED", "Kiosk needs at least one app");
@@ -97,43 +244,89 @@ export function buildKioskPayload(input: {
       DISPLAY_IMAGE_LOC: "",
     };
   }
+
+  const launcherType = input.launcherType ?? 2;
+  const screenOrientation = input.screenOrientation ?? 2;
+  const screenTimeout = input.screenTimeout ?? 0;
+  if (!KIOSK_LAUNCHER_TYPES.includes(launcherType as 1 | 2)) fail("VALIDATION_FAILED", "launcherType must be 1 or 2");
+  if (!KIOSK_SCREEN_ORIENTATIONS.includes(screenOrientation as 1 | 2 | 3 | 4)) fail("VALIDATION_FAILED", "screenOrientation must be 1, 2, 3, or 4");
+  if (!KIOSK_SCREEN_TIMEOUTS.includes(screenTimeout as typeof KIOSK_SCREEN_TIMEOUTS[number])) {
+    fail("VALIDATION_FAILED", `screenTimeout must be one of: ${KIOSK_SCREEN_TIMEOUTS.join(", ")}`);
+  }
+
+  const allowStatusBar = input.allowStatusBar ?? false;
+  // Zoho rule: expansion defaults to false whenever the status bar is restricted.
+  const allowStatusBarExpansion = input.allowStatusBarExpansion ?? (allowStatusBar ? true : false);
+  const allowPowerButton = input.allowPowerButton ?? true;
+
   // Field names below are the ones fully legible in the guide's ANDROID_KIOSK_POLICY table.
   return {
     kiosk_mode: input.mode === "single" ? 0 : 1, // 0 single app, 1 multi app
     allowed_apps: JSON.stringify(allowed), // the API expects a JSON string
-    launcher_type: 2,
-    screen_orientation: 2,
-    allow_status_bar: input.allowStatusBar ?? false,
+    launcher_type: launcherType,
+    screen_orientation: screenOrientation,
+    screen_timeout: screenTimeout,
+    allow_status_bar: allowStatusBar,
+    allow_status_bar_expansion: allowStatusBarExpansion,
     allow_home_button: input.allowHomeButton ?? true,
     allow_back_button: input.allowBackButton ?? true,
-    allow_power_button: input.allowPowerButton ?? true,
+    allow_power_button: allowPowerButton,
+    // Zoho's spec: allow_shutdown defaults to the value of allow_power_button.
+    allow_shutdown: input.allowShutdown ?? allowPowerButton,
+    allow_volume_button: input.allowVolumeButton ?? true,
+    allow_key_guard: input.allowKeyGuard ?? true,
+    allow_notification: input.allowNotification ?? true,
+    allow_recent_apps: input.allowRecentApps ?? true,
+    allow_task_manager: input.allowTaskManager ?? true,
+    allow_system_error_dialog: input.allowSystemErrorDialog ?? false,
+    allow_custom_settings: input.allowCustomSettings ?? true,
+    show_me_mdm_app: input.showMeMdmApp ?? true,
     ...(input.extra ?? {}),
   };
 }
 
-/** "Wipe mode": the device is fully wiped after max_failed_attempts wrong passcodes. */
+/**
+ * ANDROID_PASSCODE_POLICY. Pushes a POLICY — Android will prompt the user to
+ * create/update their passcode on the next unlock after `grace_period` minutes.
+ * To actually set a passcode value on devices, use the reset_passcode command.
+ */
 export function buildPasscodePayload(input: {
-  passcodeType?: number; // 2 numbers, 3 alphabets, 4 alphanumeric, 5 complex
+  passcodeType?: number; // 1 pattern, 2 numbers, 3 alphabets, 4 alphanumeric, 5 complex
   minLength?: number;
   maxFailedAttempts?: number; // -1 = never wipe; 4..16 = wipe after N failures
   autoLockSeconds?: number;
   maxAgeDays?: number;
   history?: number;
+  scope?: number; // scope_for_passcode: -1 none, 0 device, 1 work profile, 2/3 reserved
+  gracePeriodMinutes?: number; // minutes before the policy becomes enforced
+  allowFingerprint?: number; // 0 restrict / 1 allow
+  allowFaceUnlock?: boolean;
+  allowIrisScan?: boolean;
+  allowOneLock?: boolean; // prevent same passcode on device + work profile
 }) {
   const p = {
+    scope_for_passcode: input.scope ?? 0,
     passcode_type: input.passcodeType ?? 2,
     min_passcode_length: input.minLength ?? 6,
     max_failed_attempts: input.maxFailedAttempts ?? 10,
     auto_lock_idle_for: input.autoLockSeconds ?? 300,
     max_passcode_age: input.maxAgeDays ?? 0,
     no_of_passcode_maintained: input.history ?? 3,
+    grace_period: input.gracePeriodMinutes ?? 60,
+    allow_fingerprint: input.allowFingerprint ?? 1,
+    allow_face_unlock: input.allowFaceUnlock ?? true,
+    allow_iris_scan: input.allowIrisScan ?? true,
+    allow_one_lock: input.allowOneLock ?? true,
   };
+  if (![-1, 0, 1, 2, 3].includes(p.scope_for_passcode)) fail("VALIDATION_FAILED", "scope must be -1, 0, 1, 2, or 3");
   if (![1, 2, 3, 4, 5].includes(p.passcode_type)) fail("VALIDATION_FAILED", "passcodeType must be 1–5");
   if (p.min_passcode_length < 4 || p.min_passcode_length > 16) fail("VALIDATION_FAILED", "minLength must be 4–16");
   if (p.max_failed_attempts !== -1 && (p.max_failed_attempts < 4 || p.max_failed_attempts > 16)) {
     fail("VALIDATION_FAILED", "maxFailedAttempts must be -1 or 4–16");
   }
   if (p.auto_lock_idle_for < 5 || p.auto_lock_idle_for > 1800) fail("VALIDATION_FAILED", "autoLockSeconds must be 5–1800");
+  if (p.grace_period < 1 || p.grace_period > 1000) fail("VALIDATION_FAILED", "gracePeriodMinutes must be 1–1000");
+  if (![0, 1].includes(p.allow_fingerprint)) fail("VALIDATION_FAILED", "allowFingerprint must be 0 or 1");
   return p;
 }
 
@@ -147,6 +340,8 @@ export function buildFrpPayload(accounts: { emailUserId: string; email: string }
 
 export function payloadNameFor(platform: "android" | "ios", purpose: Purpose): string | null {
   if (purpose === "custom") return null;
+  if (purpose === "apps") return APP_PROFILE_PAYLOAD;
+  if (purpose === "app_blacklist") return APP_BLACKLIST_PAYLOAD;
   const table = PAYLOAD[platform] as Record<string, string>;
   return table[purpose] ?? null;
 }

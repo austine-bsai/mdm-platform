@@ -193,14 +193,25 @@ async function apiBase(enterpriseId: string): Promise<string> {
 
 function mapHttpError(status: number, text: string): AppError {
   const snippet = text.slice(0, 300);
+  // Zoho returns {"error_description": "...", "error_code": "...", "localized_error_description": "..."}.
+  // Prefer the human sentence over the raw JSON so admins see "Command not applicable for Device",
+  // not the whole payload. Fall back to the snippet when the body is not JSON.
+  let friendly = snippet;
+  try {
+    const j = JSON.parse(text);
+    friendly = j.localized_error_description ?? j.error_description ?? j.message ?? snippet;
+  } catch { /* keep snippet */ }
   if (/SCOPE_MISMATCH/i.test(text)) return appError("ZOHO_SCOPE_MISMATCH", undefined, { zoho: snippet });
-  if (status === 400 || status === 422) return appError("ZOHO_BAD_REQUEST", `Zoho rejected the request: ${snippet}`, { zoho: snippet });
+  // 412 is Zoho's "precondition failed" — used for CMD0001 "Command not applicable for Device" and friends.
+  if (status === 400 || status === 412 || status === 422) {
+    return appError("ZOHO_BAD_REQUEST", friendly, { zoho: snippet });
+  }
   if (status === 401) return appError("ZOHO_UNAUTHORIZED", undefined, { zoho: snippet });
   if (status === 403) return appError("ZOHO_SCOPE_MISMATCH", undefined, { zoho: snippet });
   if (status === 404) return appError("ZOHO_NOT_FOUND", undefined, { zoho: snippet });
   if (status === 429) return appError("ZOHO_RATE_LIMITED");
   if (status >= 500) return appError("ZOHO_UNAVAILABLE", `Zoho returned ${status}`);
-  return appError("ZOHO_BAD_REQUEST", `Zoho returned ${status}: ${snippet}`);
+  return appError("ZOHO_BAD_REQUEST", `Zoho returned ${status}: ${friendly}`);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
